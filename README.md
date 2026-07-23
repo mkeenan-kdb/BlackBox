@@ -26,18 +26,21 @@ There's no cloud, no third-party storage, and no account system beyond what you 
 ## How it works
 
 1. **Frontend → backend transport.** The browser opens a WebSocket to the q process (`html/js/connect.js`) and speaks a small JSON-over-IPC protocol (`html/js/external/c.js` handles the kdb+ serialization). Downloads happen separately over a plain HTTP `GET`, so the browser's native download/streaming path can handle large files instead of piping them through the WebSocket/JSON round trip.
-2. **Authentication.** The client sends a userid/password to `authUser`. The backend hashes the password (salted, stretched) and compares it against the `userinfo` table. On success, the server records a session against the WebSocket handle - every subsequent request derives "who is this" from that handle server-side, never from anything the client claims.
-3. **Encryption.** On successful login the password is kept **only in browser memory** (`window.sessionPassword`) for the session - it's never sent again and the server never stores or sees the actual encryption key. Each file gets its own random salt; the browser runs PBKDF2 on the session password to derive an AES-256-GCM key, encrypts the file client-side, and only the ciphertext (plus the random IV/salt) is uploaded.
-4. **Chunked upload.** The encrypted bytes are base64-encoded and streamed to the server in fixed-size chunks over the WebSocket (`startUpload` → repeated `uploadChunk` → `finishUpload`), so upload memory use stays bounded regardless of file size and a single file is never forced into one WebSocket/JSON message.
-5. **Download.** The client requests a short-lived, single-use HTTP download token over the WebSocket, then fetches the ciphertext via `GET /download?...` (handled natively in q via `.z.ph`), and decrypts it client-side with the key re-derived from the session password and the file's stored salt.
-6. **Session hygiene.** The tab auto-locks (clears the in-memory password and logs out) after 5 minutes of inactivity. Failed logins are rate-limited per connection.
+2. **Authentication.** The password itself never crosses the wire, not even at login. The client requests a single-use challenge (`getAuthChallenge`), then proves it knows the password by computing HMAC-MD5 of the server's stored auth hash and the challenge nonce - `authUser` just checks that proof matches. On success, the server records a session against the WebSocket handle - every subsequent request derives "who is this" from that handle server-side, never from anything the client claims.
+3. **Key wrapping.** Each user has one random Master Encryption Key (MEK), generated client-side the first time they ever log in and never changed after that. The MEK is itself encrypted ("wrapped") with a key derived (PBKDF2) from the login password, and only that wrapped form is stored server-side. On login, the browser unwraps it into memory (`window.sessionMEK`) - the server never sees the MEK or the password-derived key that protects it.
+4. **Per-file encryption.** Every file gets its own random key, generated client-side and wrapped with the session MEK before upload. The file itself is encrypted (AES-256-GCM) with that per-file key; only the ciphertext, its wrapped key, and a random IV are sent to the server.
+5. **Chunked upload.** The encrypted bytes are base64-encoded and streamed to the server in fixed-size chunks over the WebSocket (`startUpload` → repeated `uploadChunk` → `finishUpload`), so upload memory use stays bounded regardless of file size and a single file is never forced into one WebSocket/JSON message.
+6. **Download.** The client requests a short-lived, single-use HTTP download token over the WebSocket, then fetches the ciphertext via `GET /download?...` (handled natively in q via `.z.ph`), unwraps that file's key with the session MEK, and decrypts client-side.
+7. **Session hygiene.** The tab auto-locks (clears the in-memory password and MEK, and logs out) after 5 minutes of inactivity. Failed logins are rate-limited per connection.
 
 ## Security model
 
-- The server authenticates you (it needs the password once, in cleartext, over the connection, to check it against the stored hash) but it never persists your password or your derived encryption key - only a salted hash for auth, and per-file salts/IVs alongside the ciphertext.
-- This means: anyone with access to the vault directory on disk sees only encrypted blobs, not your files.
+- The server never sees your password, your MEK, or any file's encryption key, even in transit - only a salted auth hash, a login proof derived from it, the password-wrapped MEK, and each file's MEK-wrapped key, alongside the ciphertext.
+- The auth challenge-response uses HMAC-MD5, not a true zero-knowledge protocol like SRP. q has no SHA-256 or bignum support to build real SRP on safely, and hand-rolling big-integer modular exponentiation in a language never designed for it is a bigger risk than the gap this closes. HMAC-MD5 still means the password is never transmitted or logged anywhere, which is the practical goal here - it just means the server's stored auth hash is "password-equivalent" (whoever has the `userinfo` table can forge a valid login) the same way a stolen bcrypt hash would be for any conventional site. That's an explicit trade-off, not an oversight.
+- This means: anyone with access to the vault directory and database on disk sees only encrypted blobs and wrapped keys, never your files or your password.
 - It does **not** mean the wire traffic is protected on its own - the WebSocket is currently plain `ws://`, not `wss://`. That's fine on a trusted LAN. If you want to reach your BlackBox from outside your home network, put it behind a TLS-terminating reverse proxy (Caddy, nginx) or a private tunnel (Tailscale, WireGuard) rather than exposing the raw port to the internet.
-- There is no password-reset flow. If a user forgets their password, an admin has to set a new one for them via the q console (see below) - there's no way to recover encrypted files without the original password, by design.
+- **Changing your own password** (the "Change Password" button once logged in) re-wraps your existing MEK under the new password - every file, including everything uploaded before the change, stays readable. Nothing on disk gets re-encrypted.
+- **An admin resetting a forgotten password** via the console (`addUser`, below) is a different story: the admin doesn't have the old password, so the previously-wrapped MEK can't be re-wrapped - it's orphaned. The next login bootstraps a brand new MEK automatically, but any file encrypted under the old one becomes permanently unreadable. There's no way around this without knowing the original password, by design - it's the same tradeoff every zero-knowledge-encrypted system makes.
 
 ## Adding users
 
@@ -47,7 +50,9 @@ There's no self-service sign-up in the UI on purpose - this is a personal/family
 addUser `userid`passphrase!("someuser";"their-password")
 ```
 
-This salts and hashes the password and writes the user record to the `userinfo` table (persisted under `BLACKBOX_DB_DIR`). The user can log in from the web UI immediately after. To change a password, just call `addUser` again for the same `userid` - it upserts.
+This salts and hashes the password and writes the user record to the `userinfo` table (persisted under `BLACKBOX_DB_DIR`). The user can log in from the web UI immediately after, which is when their master encryption key actually gets generated (see [Security model](#security-model)).
+
+Calling `addUser` again for an existing `userid` resets their password - but it's a blunt instrument, appropriate for "this person forgot their password," not for routine password changes. It always breaks access to any file encrypted before the reset (see [Security model](#security-model)). A logged-in user changing their own password from the UI ("Change Password" button) doesn't have this problem.
 
 ## Getting started
 
@@ -130,7 +135,7 @@ kx/
 
 ## Known limitations
 
-- No self-service registration or password reset (see [Adding users](#adding-users)) - intentional for a personal vault, but worth knowing before you hand this to family members who'll forget passwords.
+- No self-service registration, and no recovery for a genuinely forgotten password (see [Adding users](#adding-users)) - intentional for a personal vault, but worth knowing before you hand this to family members who'll forget passwords. Changing a *known* password is self-service (see [Security model](#security-model)).
 - WebSocket transport is unencrypted (`ws://`) by default; see [Security model](#security-model) for how to expose this safely off-LAN.
 - No disk-space check before accepting an upload - a write that runs out of space partway through can leave a corrupt file that has to be re-uploaded.
 - The "storage used / capacity" indicator is cosmetic (see [Configuration reference](#configuration-reference)), not a real quota.

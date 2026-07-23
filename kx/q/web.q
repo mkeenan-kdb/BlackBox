@@ -9,13 +9,15 @@
 .web.downloadTokens:()!()
 // Chunked uploads in progress: fileid(sym) -> metadata dict (see startUpload)
 .web.uploadSessions:()!()
+// Single-use login challenges: nonce(sym) -> (userid;handle;expiry) - see getAuthChallenge
+.web.authChallenges:()!()
 
 // userid bound to the current handle, or signal if the caller isn't authenticated
 .web.currentUser:{$[.z.w in key .web.sessions; .web.sessions .z.w; '"not authenticated"]}
 
 // Whitelisted dispatch: only these functions are reachable from the socket.
 // Prevents arbitrary q execution from client-supplied `func` strings.
-.web.allowed:`authUser`recentUploadsForUser`startUpload`uploadChunk`finishUpload`getDownloadToken`deleteFile`getSystemStats`deviceInfo
+.web.allowed:`authUser`recentUploadsForUser`startUpload`uploadChunk`finishUpload`getDownloadToken`deleteFile`getSystemStats`deviceInfo`setMEK`changePassword`getAuthChallenge`upgradeLegacyAuth
 process:{[op]
   f:`$op`func;
   if[not f in .web.allowed;'"unknown function: ",string f];

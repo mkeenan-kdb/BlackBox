@@ -20,12 +20,22 @@ if[not `uploads in key `.;
     uploadDate:0#0Np;
     fileSize:0#0Nj;
     iv:();
-    salt:());
+    salt:();
+    fileKeyWrapped:();
+    fileKeyIv:());
   ];
+// Ensure uploads carries master-key-envelope columns (legacy rows load without them -
+// they keep decrypting via the old per-file salt path, see deriveKeyForSalt client-side)
+if[`uploads in key `.;
+  if[not `fileKeyWrapped in cols uploads;
+    uploads:1!update fileKeyWrapped:(count i)#enlist"",fileKeyIv:(count i)#enlist"" from 0!uploads]];
 
 // Ensure userinfo carries a per-user salt column (legacy rows load without one)
 if[`userinfo in key `.;
-  if[not `salt in cols userinfo; userinfo:1!update salt:(count i)#enlist"" from 0!userinfo]];
+  if[not `salt in cols userinfo; userinfo:1!update salt:(count i)#enlist"" from 0!userinfo];
+  // Ensure userinfo carries master-key-envelope columns (added for key-wrapping support)
+  if[not `mek in cols userinfo;
+    userinfo:1!update mek:(count i)#enlist"",mekIv:(count i)#enlist"",wrapSalt:(count i)#enlist"" from 0!userinfo]];
 
 //===================================LOGIC====================================//
 broadCast:{neg[x]@\:y;}
@@ -50,8 +60,9 @@ startUpload:{[params]
   if[.config.MAXUPLOAD < fileSize; :("Error";"File exceeds the maximum allowed size")];
 
   fid:`$string first neg[1]?0Ng;
-  .web.uploadSessions[fid]:`userid`fileName`mimeType`category`tags`iv`salt`bytesWritten!(
-    uid;params`fileName;params`mimeType;`$params`category;params`tags;params`iv;params`salt;0);
+  .web.uploadSessions[fid]:`userid`fileName`mimeType`category`tags`iv`salt`fileKeyWrapped`fileKeyIv`bytesWritten!(
+    uid;params`fileName;params`mimeType;`$params`category;params`tags;params`iv;params`salt;
+    params`fileKeyWrapped;params`fileKeyIv;0);
   .util.logm"Chunked upload started by ",string[uid]," for ",params[`fileName]," -> ",string fid;
   :("uploadStarted";(enlist`fileid)!enlist string fid);
  }
@@ -87,8 +98,9 @@ finishUpload:{[params]
   sess:.web.uploadSessions fid;
   if[not sess[`userid]~uid; :("Error";"Not authorised for this upload")];
 
-  `uploads upsert 1!enlist `fileid`userid`fileName`mimeType`category`tags`uploadDate`fileSize`iv`salt!(
-    fid;uid;sess`fileName;sess`mimeType;sess`category;sess`tags;.z.P;sess`bytesWritten;sess`iv;sess`salt);
+  `uploads upsert 1!enlist `fileid`userid`fileName`mimeType`category`tags`uploadDate`fileSize`iv`salt`fileKeyWrapped`fileKeyIv!(
+    fid;uid;sess`fileName;sess`mimeType;sess`category;sess`tags;.z.P;sess`bytesWritten;sess`iv;sess`salt;
+    sess`fileKeyWrapped;sess`fileKeyIv);
   .util.persist[`uploads];
   .web.uploadSessions:.web.uploadSessions _ fid;
   .util.logm"Chunked upload finished for ",string[uid]," -> ",string fid;
@@ -106,13 +118,15 @@ getDownloadToken:{[params]
 
   tok:`$.util.newSalt[];
   .web.downloadTokens[tok]:(fid;uid;.z.P+0D00:02:00);
-  :("downloadToken";`fileid`token`fileName`mimeType`iv`salt!(
+  :("downloadToken";`fileid`token`fileName`mimeType`iv`salt`fileKeyWrapped`fileKeyIv!(
     string fid;
     string tok;
     rec`fileName;
     rec`mimeType;
     rec`iv;
-    rec`salt
+    rec`salt;
+    rec`fileKeyWrapped;
+    rec`fileKeyIv
   ));
  }
 
@@ -157,41 +171,100 @@ addUser:{
   .util.putUser[uid;.util.hashPass[salt;x`passphrase];salt];
  }
 
-/pull the user credentials from disk and ensure userid and pw match
+/ Issue a single-use login challenge. The salt is whatever's actually stored for this user
+/ (empty means their account predates salted hashing - see the legacy branch in authUser),
+/ or a fake-but-plausible one for an unknown userid so the response shape doesn't itself
+/ reveal which usernames exist. Opportunistically prunes expired challenges on every call
+/ rather than running a separate timer for it.
+getAuthChallenge:{[params]
+  live:.z.P<=(value .web.authChallenges)[;2];
+  .web.authChallenges:((key .web.authChallenges) where live)!(value .web.authChallenges) where live;
+
+  uid:`$params`userid;
+  exists:(`userinfo in key `.) and uid in exec userid from userinfo;
+  salt:$[exists; (userinfo uid)`salt; .util.newSalt[]];
+  nonce:`$.util.newSalt[],.util.newSalt[];
+  .web.authChallenges[nonce]:(uid;.z.w;.z.P+0D00:02:00);
+  :("authChallenge";`nonce`salt!(string nonce;salt));
+ }
+
+/ Verify a login proof against a previously-issued challenge, without the password itself
+/ ever having been sent. The client computes AK the same way the stored `passphrase` hash
+/ was derived (salted .util.hashPass, or plain md5 for a legacy pre-salt account) and proves
+/ it knows AK via HMAC-MD5(AK, nonce) - see .util.hmacMd5 in util.q for why MD5/HMAC rather
+/ than real SRP (q has no SHA-256 or bignum to build that on safely).
 authUser:{[creds]
   .util.logm"Requesting authentication for handle: ",string[.z.w];
-  if[any all@/:null creds;:("authResp";0b);];
-  if[not`userinfo in key`.;:("authResp";0b)];
+  noAuth:{("authResp";`ok`mek`mekIv`wrapSalt!(0b;"";"";""))};
+  if[any all@/:null creds; :noAuth[]];
+  if[not `userinfo in key `.; :noAuth[]];
 
   / Rate limit brute-force attempts per handle
   fails:$[.z.w in key .web.authFails; .web.authFails .z.w; 0];
-  if[fails>=.config.MAXFAILS; .util.logm"Auth attempts exceeded on handle ",string[.z.w]; :("authResp";0b);];
+  if[fails>=.config.MAXFAILS; .util.logm"Auth attempts exceeded on handle ",string[.z.w]; :noAuth[]];
+
+  nonce:`$creds`nonce;
+  if[not nonce in key .web.authChallenges; .web.authFails[.z.w]:fails+1; :noAuth[]];
+  chal:.web.authChallenges nonce;
+  .web.authChallenges:.web.authChallenges _ nonce; / single-use regardless of outcome
 
   uid:`$creds`userid;
-  pass:creds`pass;
-  exists:uid in exec userid from userinfo;
-  ok:0b; legacy:0b;
-  if[exists;
-    rec:userinfo uid;
-    / A record with an empty salt predates salted hashing (legacy unsalted md5)
-    legacy:0=count rec`salt;
-    ok:$[legacy; rec[`passphrase]~raze string md5 pass;
-         rec[`passphrase]~.util.hashPass[rec`salt;pass]]];
+  ok:0b; rec:(::);
+  if[(chal[0]~uid) and (chal[1]=.z.w) and .z.P<=chal 2;
+    exists:uid in exec userid from userinfo;
+    if[exists;
+      rec:userinfo uid;
+      ok:(raze string .util.hmacMd5[rec`passphrase;string nonce])~creds`proof]];
 
-  / Transparently upgrade a legacy hash to the salted scheme on first good login
-  if[ok and legacy;
-     salt:.util.newSalt[];
-     .util.putUser[uid;.util.hashPass[salt;pass];salt];
-     .util.logm"Upgraded password hash for ",string uid];
+  if[not ok; .web.authFails[.z.w]:fails+1; :noAuth[]];
 
-  $[ok;
-    [ .web.sessions[.z.w]:uid;
-      .web.authFails:.web.authFails _ .z.w;
-      updkols:`userid`event`ip`sessionStart`sessionEnd;
-      updvalz:(uid;`open;.util.za2ip[.z.a];.z.P;0Np);
-      .util.ammend[`dailyConns;(.z.w;updkols);updvalz];
-      updUserNumUsers[] ];
-    .web.authFails[.z.w]:fails+1];
-  :("authResp";ok);
+  .web.sessions[.z.w]:uid;
+  .web.authFails:.web.authFails _ .z.w;
+  updkols:`userid`event`ip`sessionStart`sessionEnd;
+  updvalz:(uid;`open;.util.za2ip[.z.a];.z.P;0Np);
+  .util.ammend[`dailyConns;(.z.w;updkols);updvalz];
+  updUserNumUsers[];
+  / mek/mekIv/wrapSalt are blank for a user who has never logged in from a browser yet
+  / (created via console addUser) or who predates the master-key-envelope scheme - the
+  / client bootstraps a fresh one in that case (see handleAuth/setMEK).
+  :("authResp";`ok`mek`mekIv`wrapSalt!(1b;rec`mek;rec`mekIv;rec`wrapSalt));
+ }
+
+/ Client-driven upgrade of a legacy (pre-salt, single-round-md5) auth hash to the salted
+/ scheme, run once automatically right after a successful legacy-scheme login. authUser can
+/ no longer do this transparently server-side the way it used to - the server never sees the
+/ plaintext password anymore - so the browser (which just proved it knows the password)
+/ derives the new salted hash itself and pushes it here.
+upgradeLegacyAuth:{[params]
+  uid:.web.currentUser[];
+  userinfo[uid;`passphrase`salt]:(params`newHash;params`newSalt);
+  .util.persist[`userinfo];
+  .util.logm"Upgraded legacy password hash for ",string uid;
+  :("legacyAuthUpgraded";1b);
+ }
+
+/ Store the caller's newly generated, password-wrapped master encryption key. The server
+/ only ever sees ciphertext. Called once after first login (no MEK yet) or to bootstrap a
+/ replacement after an admin-driven password reset invalidates the previous one (see
+/ changePassword for the self-service path that instead re-wraps the SAME key).
+setMEK:{[params]
+  uid:.web.currentUser[];
+  userinfo[uid;`mek`mekIv`wrapSalt]:(params`mek;params`mekIv;params`wrapSalt);
+  .util.persist[`userinfo];
+  .util.logm"Master key envelope set for ",string uid;
+  :("mekSet";1b);
+ }
+
+/ Self-service password change. The new password never crosses the wire either - the client
+/ sends the already-salted-and-hashed auth verifier (same derivation authUser checks against)
+/ plus the MEK, re-wrapped under the new password client-side. Only the envelope and the
+/ auth hash change here; nothing on disk gets re-encrypted, so every file stays readable.
+changePassword:{[params]
+  uid:.web.currentUser[];
+  userinfo[uid;`passphrase`salt]:(params`newHash;params`newSalt);
+  userinfo[uid;`mek`mekIv`wrapSalt]:(params`newMek;params`newMekIv;params`newWrapSalt);
+  .util.persist[`userinfo];
+  .util.logm"Password changed for ",string uid;
+  :("passwordChanged";1b);
  }
 

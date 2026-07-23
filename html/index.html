@@ -47,6 +47,8 @@
                     <i class="ph ph-users"></i>
                     <span id="numUsers">0</span> Online
                 </div>
+                <button id="changePasswordBtn" class="btn btn-secondary logout-btn hide"
+                    onclick="openChangePassword()">Change Password</button>
                 <button id="logoutBtn" class="btn btn-secondary btn-small logout-btn hide"
                     onclick="logout()">Lock</button>
             </div>
@@ -160,6 +162,33 @@
             <div id="authSpinner" class="spinner-container hide">
                 <i class="ph ph-spinner-gap spin-icon"></i>
                 <p>Connecting...</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- Change Password Modal -->
+    <div id="changePasswordModal" class="modal-overlay hide">
+        <div class="modal glass-panel">
+            <div class="modal-header">
+                <i class="ph-fill ph-key"></i>
+                <h2>Change Password</h2>
+            </div>
+            <div class="modal-body">
+                <p>Your files stay readable - only your master key gets re-wrapped with the new password.</p>
+                <div class="input-group">
+                    <i class="ph ph-lock-key"></i>
+                    <input type="password" id="currentPasswordInput" placeholder="Current passphrase" autocomplete="off" />
+                </div>
+                <div class="input-group">
+                    <i class="ph ph-lock-key-open"></i>
+                    <input type="password" id="newPasswordInput" placeholder="New passphrase" autocomplete="off" />
+                </div>
+                <div class="input-group">
+                    <i class="ph ph-lock-key-open"></i>
+                    <input type="password" id="confirmPasswordInput" placeholder="Confirm new passphrase" autocomplete="off" />
+                </div>
+                <button class="btn btn-primary full-width" onclick="submitChangePassword()">Update Password</button>
+                <button class="btn btn-secondary full-width" onclick="closeChangePassword()">Cancel</button>
             </div>
         </div>
     </div>

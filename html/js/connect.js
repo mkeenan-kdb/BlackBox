@@ -74,6 +74,10 @@ const connect = () => {
                     case "uploadStarted":
                     case "chunkAck":
                     case "downloadToken":
+                    case "mekSet":
+                    case "passwordChanged":
+                    case "authChallenge":
+                    case "legacyAuthUpgraded":
                         if (pendingResponse) {
                             const { resolve } = pendingResponse;
                             pendingResponse = null;

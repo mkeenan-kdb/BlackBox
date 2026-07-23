@@ -16,5 +16,37 @@
 // ~100ms per attempt; swap for a real KDF if this ever guards more than a personal vault.
 .util.hashPass:{[salt;pass] r:pass; do[100000; r:raze string md5 salt,r]; r}
 
-// Write/replace a user record (keyed on userid)
-.util.putUser:{[uid;hash;salt] `userinfo upsert 1!enlist `userid`passphrase`salt!(uid;hash;salt); .util.persist[`userinfo];}
+// Bitwise XOR of two equal-length byte vectors (q has no native byte-XOR - decompose to
+// bits, use <> as XOR on booleans, reassemble). Used by hmacMd5 below.
+.util.xorBytes:{[x;y] "x"$2 sv/: (0b vs/: x) <> 0b vs/: y}
+
+// HMAC-MD5 (RFC 2104 construction over the native md5). Used for the login challenge-
+// response (see authUser/getAuthChallenge in blackbox.q) so the password itself never has
+// to cross the wire - only a proof that the client can compute the same stored hash the
+// server already has. q has no SHA-256/bignum, which is what real SRP would need; this is
+// the deliberately lighter-weight alternative the design explicitly allows for.
+// Verified byte-for-byte against Node's crypto.createHmac('md5', ...) across empty-key,
+// short-key and >blocksize-key cases before this went anywhere near the auth path.
+.util.hmacBlockSize:64
+.util.hmacMd5:{[hkey;msg]
+  bs:.util.hmacBlockSize;
+  kb:`byte$hkey;
+  kb:$[bs<count kb; `byte$md5 hkey; kb];
+  kb:kb,(bs-count kb)#0x00;
+  ipad:bs#0x36;
+  opad:bs#0x5c;
+  inner:md5 "c"$(.util.xorBytes[kb;ipad]),`byte$msg;
+  md5 "c"$(.util.xorBytes[kb;opad]),inner
+ }
+
+// Write/replace a user's auth credentials (keyed on userid). Amends passphrase/salt in
+// place on an existing row so any already-stored master-key-envelope columns (mek/mekIv/
+// wrapSalt - see setMEK/changePassword in blackbox.q) are left untouched; only creates a
+// blank-envelope row from scratch for a brand new userid.
+.util.putUser:{[uid;hash;salt]
+  if[not `userinfo in key `.; userinfo::([userid:0#`] passphrase:();salt:();mek:();mekIv:();wrapSalt:())];
+  $[uid in exec userid from userinfo;
+    userinfo[uid;`passphrase`salt]:(hash;salt);
+    `userinfo upsert 1!enlist `userid`passphrase`salt`mek`mekIv`wrapSalt!(uid;hash;salt;"";"";"")];
+  .util.persist[`userinfo];
+ }

@@ -1,6 +1,7 @@
 // Modernized secure digital vault JS
 window.currentUser = "";
-window.sessionPassword = null; // kept in memory for the session to derive per-file keys
+window.sessionPassword = null; // kept in memory for the session; still needed to decrypt legacy (pre-MEK) files
+window.sessionMEK = null; // unwrapped master encryption key (CryptoKey) for the session - wraps/unwraps per-file keys
 window.activePreviewBlob = null;
 window.activePreviewName = "";
 
@@ -137,20 +138,165 @@ const decryptData = async (encryptedArrayBuffer, cryptoKey, ivBase64) => {
 
 // Derive the AES key for a file from the session password and the file's own salt.
 // An empty salt means the file predates per-file salts, so fall back to the legacy salt.
+// Only used for files that predate the master-key-envelope scheme below (no fileKeyWrapped).
 const deriveKeyForSalt = async (saltBase64) => {
     const salt = saltBase64 ? new Uint8Array(await base64ToBuffer(saltBase64)) : LEGACY_SALT;
     return deriveKeyFromPassword(window.sessionPassword, salt);
 };
+
+// ============================== KEY WRAPPING (MEK) ============================ //
+// Every file is encrypted with its own random key (FK). FK is itself encrypted ("wrapped")
+// with a per-user Master Encryption Key (MEK), which is generated once and never changes.
+// The MEK is wrapped with a key derived from the login password (KEK) and stored server-side
+// only in that wrapped form. Changing the password only needs to re-wrap the MEK (see
+// wrapMEK/submitChangePassword) - every file's wrapped FK, and so every file, stays readable.
+const generateMEK = () => crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, true, ["encrypt", "decrypt"]);
+
+// Wrap a MEK CryptoKey (freshly generated, or the session's existing one when changing
+// password) with a KEK derived from `password`. Returns the envelope to send to the server.
+const wrapMEK = async (mekKey, password) => {
+    const rawMek = await crypto.subtle.exportKey("raw", mekKey);
+    const wrapSalt = crypto.getRandomValues(new Uint8Array(16));
+    const kek = await deriveKeyFromPassword(password, wrapSalt);
+    const { encryptedData, iv } = await encryptData(rawMek, kek);
+    return {
+        mek: await bufferToBase64(encryptedData),
+        mekIv: iv,
+        wrapSalt: await bufferToBase64(wrapSalt.buffer)
+    };
+};
+
+// Unwrap a stored MEK envelope using `password`. Throws (AES-GCM auth failure) if the
+// envelope was wrapped under a different password - e.g. an admin reset the password via
+// the console without knowing the old one, orphaning the previous envelope.
+const unwrapMEK = async (password, mekBase64, mekIvBase64, wrapSaltBase64) => {
+    const wrapSalt = new Uint8Array(await base64ToBuffer(wrapSaltBase64));
+    const kek = await deriveKeyFromPassword(password, wrapSalt);
+    const wrapped = await base64ToBuffer(mekBase64);
+    const rawMek = await decryptData(wrapped, kek, mekIvBase64);
+    return crypto.subtle.importKey("raw", rawMek, { name: "AES-GCM" }, true, ["encrypt", "decrypt"]);
+};
+
+// Generate a fresh per-file key and wrap it with the session MEK, for a new upload.
+const generateAndWrapFileKey = async () => {
+    const fkKey = await crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, true, ["encrypt", "decrypt"]);
+    const rawFk = await crypto.subtle.exportKey("raw", fkKey);
+    const { encryptedData, iv } = await encryptData(rawFk, window.sessionMEK);
+    return { fkKey, fileKeyWrapped: await bufferToBase64(encryptedData), fileKeyIv: iv };
+};
+
+// Unwrap a file's key using the session MEK, for download/preview.
+const unwrapFileKey = async (fileKeyWrappedBase64, fileKeyIvBase64) => {
+    const wrapped = await base64ToBuffer(fileKeyWrappedBase64);
+    const rawFk = await decryptData(wrapped, window.sessionMEK, fileKeyIvBase64);
+    return crypto.subtle.importKey("raw", rawFk, { name: "AES-GCM" }, true, ["encrypt", "decrypt"]);
+};
+
+// ============================== MD5 / CHALLENGE-RESPONSE LOGIN ============================ //
+// Web Crypto has no MD5 (browsers dropped it from SubtleCrypto). The server's stored auth
+// hash is q's iterated-salted-MD5 (.util.hashPass in util.q, unchanged), so logging in
+// without ever sending the password means the browser has to speak the same MD5-based
+// scheme. This is a plain RFC 1321 implementation, verified byte-for-byte against Node's
+// crypto module and against q's native md5 (including RFC edge cases and multi-block
+// messages) before being wired into the login path.
+const md5 = (bytes) => {
+    const s = [7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
+        5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
+        4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+        6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21];
+    const K = new Int32Array(64);
+    for (let i = 0; i < 64; i++) K[i] = Math.floor(Math.abs(Math.sin(i + 1)) * 4294967296) | 0;
+
+    const msgLenBits = BigInt(bytes.length) * 8n;
+    const padLen = (56 - (bytes.length + 1) % 64 + 64) % 64;
+    const padded = new Uint8Array(bytes.length + 1 + padLen + 8);
+    padded.set(bytes);
+    padded[bytes.length] = 0x80;
+    new DataView(padded.buffer, padded.length - 8, 8).setBigUint64(0, msgLenBits, true);
+
+    let a0 = 0x67452301, b0 = 0xefcdab89, c0 = 0x98badcfe, d0 = 0x10325476;
+    const rotl = (x, c) => (x << c) | (x >>> (32 - c));
+
+    for (let chunkStart = 0; chunkStart < padded.length; chunkStart += 64) {
+        const M = new Int32Array(16);
+        const dv = new DataView(padded.buffer, chunkStart, 64);
+        for (let j = 0; j < 16; j++) M[j] = dv.getInt32(j * 4, true);
+
+        let A = a0, B = b0, C = c0, D = d0;
+        for (let i = 0; i < 64; i++) {
+            let F, g;
+            if (i < 16) { F = (B & C) | (~B & D); g = i; }
+            else if (i < 32) { F = (D & B) | (~D & C); g = (5 * i + 1) % 16; }
+            else if (i < 48) { F = B ^ C ^ D; g = (3 * i + 5) % 16; }
+            else { F = C ^ (B | ~D); g = (7 * i) % 16; }
+            F = (F + A + K[i] + M[g]) | 0;
+            A = D; D = C; C = B;
+            B = (B + rotl(F, s[i])) | 0;
+        }
+        a0 = (a0 + A) | 0; b0 = (b0 + B) | 0; c0 = (c0 + C) | 0; d0 = (d0 + D) | 0;
+    }
+
+    const out = new Uint8Array(16);
+    const outView = new DataView(out.buffer);
+    outView.setInt32(0, a0, true);
+    outView.setInt32(4, b0, true);
+    outView.setInt32(8, c0, true);
+    outView.setInt32(12, d0, true);
+    return out;
+};
+
+const md5ToHex = (bytes) => Array.from(bytes).map((b) => b.toString(16).padStart(2, "0")).join("");
+
+// Mirrors .util.hashPass in kx/q/util.q exactly: r=pass; repeat 100000x: r=hex(md5(salt+r)).
+// Must stay byte-for-byte identical to the q side, or nobody can log in.
+const hashPass = (salt, pass) => {
+    const enc = new TextEncoder();
+    let r = pass;
+    for (let i = 0; i < 100000; i++) {
+        r = md5ToHex(md5(enc.encode(salt + r)));
+    }
+    return r;
+};
+
+// Standard HMAC construction over MD5 (64-byte block size) - mirrors .util.hmacMd5 in
+// util.q. Proves the client knows the same stored auth hash the server has, without ever
+// sending the password (or the hash) itself.
+const hmacMd5 = (keyStr, msgStr) => {
+    const enc = new TextEncoder();
+    let key = enc.encode(keyStr);
+    if (key.length > 64) key = md5(key);
+    const padded = new Uint8Array(64);
+    padded.set(key);
+    const ipad = new Uint8Array(64), opad = new Uint8Array(64);
+    for (let i = 0; i < 64; i++) { ipad[i] = padded[i] ^ 0x36; opad[i] = padded[i] ^ 0x5c; }
+    const msg = enc.encode(msgStr);
+    const inner = new Uint8Array(64 + msg.length);
+    inner.set(ipad); inner.set(msg, 64);
+    const innerHash = md5(inner);
+    const outer = new Uint8Array(64 + 16);
+    outer.set(opad); outer.set(innerHash, 64);
+    return md5ToHex(md5(outer));
+};
+
+// The auth key (AK) is whatever's stored server-side as the passphrase hash - salted
+// .util.hashPass normally, or a single unsalted md5 round for an account that predates
+// salted hashing (empty salt, same convention used for legacy file keys elsewhere).
+const authKeyFor = (salt, pass) => (salt ? hashPass(salt, pass) : md5ToHex(md5(new TextEncoder().encode(pass))));
 
 // ============================== AUTH FLOW ============================ //
 const authUser = () => {
     const modal = document.getElementById("authModal");
     modal.classList.remove("hide");
     document.getElementById("logoutBtn").classList.add("hide");
+    document.getElementById("changePasswordBtn").classList.add("hide");
     document.getElementById("usernameInput").focus();
 };
 
-const submitAuth = () => {
+// The password itself never goes over the wire, not even at login: request a single-use
+// challenge, prove knowledge of the stored auth hash via HMAC-MD5(AK, nonce), and send only
+// that proof. See the MD5/CHALLENGE-RESPONSE section above for why HMAC-MD5 rather than
+// real SRP (q has no SHA-256/bignum to build that on).
+const submitAuth = async () => {
     const userinp = document.getElementById("usernameInput").value.trim();
     const userpass = document.getElementById("passwordInput").value;
 
@@ -164,14 +310,69 @@ const submitAuth = () => {
     document.querySelector(".modal-body").classList.add("hide");
     document.getElementById("authSpinner").classList.remove("hide");
 
-    socket.sendCmd("authUser", { userid: userinp, pass: userpass });
+    try {
+        const chal = await sendCorrelated("getAuthChallenge", { userid: userinp });
+        const ak = authKeyFor(chal.salt, userpass);
+        const proof = hmacMd5(ak, chal.nonce);
+        // Stashed for handleAuth to pick up post-login: an empty challenge salt means this
+        // account predates salted hashing and should be upgraded now that we've proven we
+        // know the password (authUser itself can no longer do this transparently - the
+        // server never sees the plaintext to re-hash).
+        window._loginWasLegacy = !chal.salt;
+        socket.sendCmd("authUser", { userid: userinp, nonce: chal.nonce, proof: proof });
+    } catch (e) {
+        console.error("Login challenge failed:", e);
+        document.querySelector(".modal-body").classList.remove("hide");
+        document.getElementById("authSpinner").classList.add("hide");
+        notifyUser({ head: "Error", body: "Could not reach the server to log in. Try again." });
+    }
+};
+
+// Get the session MEK ready: unwrap the one the server has, or bootstrap a fresh one if
+// this is the account's first browser login, or if the stored envelope no longer opens
+// with this password (e.g. an admin reset the password via the console without knowing
+// the old one - the old envelope is orphaned, so a new key covers files uploaded from here).
+const ensureSessionMEK = async (resp) => {
+    if (resp.mek) {
+        try {
+            window.sessionMEK = await unwrapMEK(window.sessionPassword, resp.mek, resp.mekIv, resp.wrapSalt);
+            return;
+        } catch (e) {
+            console.error("MEK unwrap failed - password changed outside this browser?", e);
+            notifyUser({
+                head: "Key Recovery Needed",
+                body: "Your master key couldn't be unlocked with this password. A new one was created - files uploaded since your last password change may be unreadable."
+            });
+        }
+    }
+    const mekKey = await generateMEK();
+    const wrapped = await wrapMEK(mekKey, window.sessionPassword);
+    window.sessionMEK = mekKey;
+    await sendCorrelated("setMEK", wrapped);
+};
+
+// One-time upgrade for an account that just logged in via the legacy (pre-salt) auth
+// scheme: now that we've proven knowledge of the password via the challenge, derive a
+// proper salted hash and push it up. Best-effort - a failure here just means the account
+// stays on the legacy scheme until the next successful login retries it.
+const upgradeLegacyAuthIfNeeded = async () => {
+    if (!window._loginWasLegacy) return;
+    window._loginWasLegacy = false;
+    try {
+        const newSaltBytes = crypto.getRandomValues(new Uint8Array(16));
+        const newSalt = await bufferToBase64(newSaltBytes.buffer);
+        const newHash = hashPass(newSalt, window.sessionPassword);
+        await sendCorrelated("upgradeLegacyAuth", { newHash, newSalt });
+    } catch (e) {
+        console.error("Legacy auth upgrade failed (non-fatal):", e);
+    }
 };
 
 const handleAuth = async (resp) => {
     document.querySelector(".modal-body").classList.remove("hide");
     document.getElementById("authSpinner").classList.add("hide");
 
-    if (resp !== true) {
+    if (!resp || !resp.ok) {
         notifyUser({ head: "Authentication Failed", body: "Not authorised. Try again." });
         document.getElementById("passwordInput").value = "";
         window.tempPassword = null;
@@ -180,12 +381,24 @@ const handleAuth = async (resp) => {
         console.log("Authentication successful");
         window.currentUser = document.getElementById("usernameInput").value.trim();
 
-        // Keep the password in memory for the session so each file can use its own salt
+        // Keep the password in memory for the session - still needed to decrypt any legacy
+        // (pre-MEK) files, since those derive their key from the password directly.
         window.sessionPassword = window.tempPassword;
         window.tempPassword = null;
 
+        try {
+            await ensureSessionMEK(resp);
+            await upgradeLegacyAuthIfNeeded();
+        } catch (e) {
+            console.error("Failed to set up master key:", e);
+            notifyUser({ head: "Error", body: "Could not set up encryption for this session. Try logging in again." });
+            document.getElementById("authModal").classList.remove("hide");
+            return;
+        }
+
         document.getElementById("authModal").classList.add("hide");
         document.getElementById("logoutBtn").classList.remove("hide");
+        document.getElementById("changePasswordBtn").classList.remove("hide");
         document.getElementById("passwordInput").value = "";
 
         notifyUser({ head: "Success", body: "Successfully authenticated!" });
@@ -200,6 +413,7 @@ const handleAuth = async (resp) => {
 const logout = () => {
     window.currentUser = "";
     window.sessionPassword = null;
+    window.sessionMEK = null;
     window.activePreviewBlob = null;
     window.activePreviewName = "";
     allFiles = [];
@@ -211,6 +425,69 @@ const logout = () => {
     closePreviewModal();
     stopInactivityTimer();
     authUser();
+};
+
+// ============================== CHANGE PASSWORD ============================ //
+const openChangePassword = () => {
+    document.getElementById("changePasswordModal").classList.remove("hide");
+    document.getElementById("currentPasswordInput").focus();
+};
+
+const closeChangePassword = () => {
+    document.getElementById("changePasswordModal").classList.add("hide");
+    document.getElementById("currentPasswordInput").value = "";
+    document.getElementById("newPasswordInput").value = "";
+    document.getElementById("confirmPasswordInput").value = "";
+};
+
+const submitChangePassword = async () => {
+    const currentPassword = document.getElementById("currentPasswordInput").value;
+    const newPassword = document.getElementById("newPasswordInput").value;
+    const confirmPassword = document.getElementById("confirmPasswordInput").value;
+
+    if (!currentPassword || !newPassword) {
+        notifyUser({ head: "Error", body: "Please fill in all fields." });
+        return;
+    }
+    if (newPassword !== confirmPassword) {
+        notifyUser({ head: "Error", body: "New passwords don't match." });
+        return;
+    }
+    if (currentPassword !== window.sessionPassword) {
+        notifyUser({ head: "Error", body: "Current passphrase is incorrect." });
+        return;
+    }
+    if (pendingResponse) {
+        notifyUser({ head: "Please wait", body: "Another operation is already in progress." });
+        return;
+    }
+
+    toggleServerBusy(true);
+    try {
+        // Re-wrap the SAME session MEK under the new password - not a new one, or every
+        // file encrypted so far would become unreadable.
+        const wrapped = await wrapMEK(window.sessionMEK, newPassword);
+        // The new password never crosses the wire either - send the already-salted-and-
+        // hashed auth verifier (same derivation authUser checks against), not the plaintext.
+        const newAuthSaltBytes = crypto.getRandomValues(new Uint8Array(16));
+        const newSalt = await bufferToBase64(newAuthSaltBytes.buffer);
+        const newHash = hashPass(newSalt, newPassword);
+        await sendCorrelated("changePassword", {
+            newHash: newHash,
+            newSalt: newSalt,
+            newMek: wrapped.mek,
+            newMekIv: wrapped.mekIv,
+            newWrapSalt: wrapped.wrapSalt
+        });
+        window.sessionPassword = newPassword;
+        closeChangePassword();
+        notifyUser({ head: "Password Changed", body: "Your password has been updated. All files remain accessible." });
+    } catch (e) {
+        console.error(e);
+        notifyUser({ head: "Error", body: e.message || "Failed to change password." });
+    } finally {
+        toggleServerBusy(false);
+    }
 };
 
 // ============================== INACTIVITY LOCK ============================ //
@@ -453,9 +730,8 @@ const uploadOneFile = async (file, category, userTags, index, total) => {
     updateUploadProgress(index, total, file.name, 0);
 
     const arrayBuffer = await readFile(file);
-    const fileSalt = crypto.getRandomValues(new Uint8Array(16));
-    const fileKey = await deriveKeyFromPassword(window.sessionPassword, fileSalt);
-    const { encryptedData, iv } = await encryptData(arrayBuffer, fileKey);
+    const { fkKey, fileKeyWrapped, fileKeyIv } = await generateAndWrapFileKey();
+    const { encryptedData, iv } = await encryptData(arrayBuffer, fkKey);
     const encryptedBytes = new Uint8Array(encryptedData);
     // Computed rather than measured off a real base64 string - see CHUNK_SIZE comment.
     const base64Length = Math.ceil(encryptedBytes.length / 3) * 4;
@@ -473,7 +749,9 @@ const uploadOneFile = async (file, category, userTags, index, total) => {
         category: category,
         tags: combinedTags,
         iv: iv,
-        salt: await bufferToBase64(fileSalt.buffer)
+        salt: "", // unused for new uploads - key comes wrapped via fileKeyWrapped/MEK instead
+        fileKeyWrapped: fileKeyWrapped,
+        fileKeyIv: fileKeyIv
     });
     const fileid = startResp.fileid;
 
@@ -496,7 +774,7 @@ const uploadFiles = async () => {
         notifyUser({ head: "Upload Error", body: "Please select a file first." });
         return;
     }
-    if (!window.sessionPassword) {
+    if (!window.sessionPassword || !window.sessionMEK) {
         notifyUser({ head: "Encryption Error", body: "Not authenticated. Cannot encrypt file." });
         return;
     }
@@ -554,6 +832,8 @@ const downloadFile = async (fileid) => {
             mimeType: tokenResp.mimeType,
             iv: tokenResp.iv,
             salt: tokenResp.salt,
+            fileKeyWrapped: tokenResp.fileKeyWrapped,
+            fileKeyIv: tokenResp.fileKeyIv,
             fileData: base64Data
         });
     } catch (e) {
@@ -578,7 +858,9 @@ const handleDownloadResp = async (msgData) => {
     }
 
     try {
-        const fileKey = await deriveKeyForSalt(msgData.salt);
+        const fileKey = msgData.fileKeyWrapped
+            ? await unwrapFileKey(msgData.fileKeyWrapped, msgData.fileKeyIv)
+            : await deriveKeyForSalt(msgData.salt);
         const encryptedBuffer = await base64ToBuffer(msgData.fileData);
         const decryptedBuffer = await decryptData(encryptedBuffer, fileKey, msgData.iv);
 
