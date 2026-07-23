@@ -16,6 +16,9 @@ if[not .config.DEVMODE;
 / base64-encoded per-file ceiling; cap total vault storage per file
 .config.MAXUPLOAD:2*1024*1024*1024
 .config.MAXFAILS:5
+/ startUpload rejects new uploads once the vault filesystem's free space drops below this
+/ percentage - see .util.diskStats/startUpload in blackbox.q
+.config.MIN_DISK_HEADROOM_PCT:5
 /normal load for DEVMODE
 .util.devload:{[kpath] system"l ",kpath;}
 /safe eval for non DEVMODE

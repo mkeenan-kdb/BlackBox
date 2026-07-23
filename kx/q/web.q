@@ -17,7 +17,7 @@
 
 // Whitelisted dispatch: only these functions are reachable from the socket.
 // Prevents arbitrary q execution from client-supplied `func` strings.
-.web.allowed:`authUser`recentUploadsForUser`startUpload`uploadChunk`finishUpload`getDownloadToken`deleteFile`getSystemStats`deviceInfo`setMEK`changePassword`getAuthChallenge`upgradeLegacyAuth
+.web.allowed:`authUser`recentUploadsForUser`startUpload`uploadChunk`finishUpload`getDownloadToken`deleteFile`getSystemStats`deviceInfo`setMEK`changePassword`getAuthChallenge`upgradeLegacyAuth`getFileVersions`adminListUsers`adminCreateUser`adminDeleteUser
 process:{[op]
   f:`$op`func;
   if[not f in .web.allowed;'"unknown function: ",string f];

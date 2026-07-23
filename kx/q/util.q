@@ -39,14 +39,25 @@
   md5 "c"$(.util.xorBytes[kb;opad]),inner
  }
 
+// Actual free/used/total space (in KB) for the filesystem hosting `path`, via `df -Pk`.
+// `path` is always a server-configured directory (BLACKBOX_VAULT_DIR), never client input,
+// so shelling out here carries none of the injection risk that ruled out shelling out for
+// the auth crypto - this is a fixed, trusted argument, not attacker-controlled data.
+.util.diskStats:{[path]
+  lines:system"df -Pk ",path;
+  toks:" " vs lines[1];
+  toks:toks where 0<count each toks;
+  `totalKB`usedKB`availKB!"J"$toks 1 2 3
+ }
+
 // Write/replace a user's auth credentials (keyed on userid). Amends passphrase/salt in
 // place on an existing row so any already-stored master-key-envelope columns (mek/mekIv/
 // wrapSalt - see setMEK/changePassword in blackbox.q) are left untouched; only creates a
 // blank-envelope row from scratch for a brand new userid.
 .util.putUser:{[uid;hash;salt]
-  if[not `userinfo in key `.; userinfo::([userid:0#`] passphrase:();salt:();mek:();mekIv:();wrapSalt:())];
+  if[not `userinfo in key `.; userinfo::([userid:0#`] passphrase:();salt:();mek:();mekIv:();wrapSalt:();isAdmin:0#0b)];
   $[uid in exec userid from userinfo;
     userinfo[uid;`passphrase`salt]:(hash;salt);
-    `userinfo upsert 1!enlist `userid`passphrase`salt`mek`mekIv`wrapSalt!(uid;hash;salt;"";"";"")];
+    `userinfo upsert 1!enlist `userid`passphrase`salt`mek`mekIv`wrapSalt`isAdmin!(uid;hash;salt;"";"";"";0b)];
   .util.persist[`userinfo];
  }

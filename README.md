@@ -19,7 +19,7 @@ The backend is **q/kdb+**. The frontend is plain HTML/CSS/JavaScript with no bui
 
 ## What it is
 
-Open `index.html` in a browser, log in, and you get a small vault UI: drag-and-drop file uploads (with per-file progress, multi-file batches), a searchable/tagged file list, image/PDF/text preview, and download. Everything is scoped per authenticated user - one vault, multiple accounts, each user only ever sees their own files.
+Open `index.html` in a browser, log in, and you get a small vault UI: drag-and-drop file uploads (with per-file progress, multi-file batches, and live image thumbnails), a searchable/tagged file list with hierarchical folder navigation (any tag containing `/`, e.g. `Documents/Tax/2026`), image/PDF/text preview, download, version history with the ability to upload a new revision of an existing file, and multi-select batch delete or bulk download as a ZIP. Everything is scoped per authenticated user - one vault, multiple accounts, each user only ever sees their own files - and stays in sync live across every open tab/device for that user.
 
 There's no cloud, no third-party storage, and no account system beyond what you set up yourself on the box it runs on.
 
@@ -28,10 +28,11 @@ There's no cloud, no third-party storage, and no account system beyond what you 
 1. **Frontend → backend transport.** The browser opens a WebSocket to the q process (`html/js/connect.js`) and speaks a small JSON-over-IPC protocol (`html/js/external/c.js` handles the kdb+ serialization). Downloads happen separately over a plain HTTP `GET`, so the browser's native download/streaming path can handle large files instead of piping them through the WebSocket/JSON round trip.
 2. **Authentication.** The password itself never crosses the wire, not even at login. The client requests a single-use challenge (`getAuthChallenge`), then proves it knows the password by computing HMAC-MD5 of the server's stored auth hash and the challenge nonce - `authUser` just checks that proof matches. On success, the server records a session against the WebSocket handle - every subsequent request derives "who is this" from that handle server-side, never from anything the client claims.
 3. **Key wrapping.** Each user has one random Master Encryption Key (MEK), generated client-side the first time they ever log in and never changed after that. The MEK is itself encrypted ("wrapped") with a key derived (PBKDF2) from the login password, and only that wrapped form is stored server-side. On login, the browser unwraps it into memory (`window.sessionMEK`) - the server never sees the MEK or the password-derived key that protects it.
-4. **Per-file encryption.** Every file gets its own random key, generated client-side and wrapped with the session MEK before upload. The file itself is encrypted (AES-256-GCM) with that per-file key; only the ciphertext, its wrapped key, and a random IV are sent to the server.
+4. **Per-file encryption.** Every file gets its own random key, generated client-side and wrapped with the session MEK before upload. The file itself is encrypted (AES-256-GCM) with that per-file key; only the ciphertext, its wrapped key, and a random IV are sent to the server. If it's an image, a small downscaled thumbnail is generated client-side and encrypted with that same per-file key, so the grid view can show a real preview without ever fetching the full file.
 5. **Chunked upload.** The encrypted bytes are base64-encoded and streamed to the server in fixed-size chunks over the WebSocket (`startUpload` → repeated `uploadChunk` → `finishUpload`), so upload memory use stays bounded regardless of file size and a single file is never forced into one WebSocket/JSON message.
 6. **Download.** The client requests a short-lived, single-use HTTP download token over the WebSocket, then fetches the ciphertext via `GET /download?...` (handled natively in q via `.z.ph`), unwraps that file's key with the session MEK, and decrypts client-side.
-7. **Session hygiene.** The tab auto-locks (clears the in-memory password and MEK, and logs out) after 5 minutes of inactivity. Failed logins are rate-limited per connection.
+7. **Live sync.** After an upload or delete, the server pushes a lightweight `fileListUpdated` signal to every other active session (tab, device) for that user, the same broadcast mechanism already used for the online-user count - so other open tabs refresh automatically instead of showing stale state.
+8. **Session hygiene.** The tab auto-locks (clears the in-memory password and MEK, and logs out) after 5 minutes of inactivity. Failed logins are rate-limited per connection.
 
 ## Security model
 
@@ -44,7 +45,7 @@ There's no cloud, no third-party storage, and no account system beyond what you 
 
 ## Adding users
 
-There's no self-service sign-up in the UI on purpose - this is a personal/family vault, not a public service. New accounts are created directly from the running q process's console:
+There's no self-service sign-up on purpose - this is a personal/family vault, not a public service. The **first** account always has to be created from the running q process's console:
 
 ```q
 addUser `userid`passphrase!("someuser";"their-password")
@@ -53,6 +54,17 @@ addUser `userid`passphrase!("someuser";"their-password")
 This salts and hashes the password and writes the user record to the `userinfo` table (persisted under `BLACKBOX_DB_DIR`). The user can log in from the web UI immediately after, which is when their master encryption key actually gets generated (see [Security model](#security-model)).
 
 Calling `addUser` again for an existing `userid` resets their password - but it's a blunt instrument, appropriate for "this person forgot their password," not for routine password changes. It always breaks access to any file encrypted before the reset (see [Security model](#security-model)). A logged-in user changing their own password from the UI ("Change Password" button) doesn't have this problem.
+
+### Admins and the web-based user management panel
+
+Nobody is an admin by default. Grant it from the console (also the only way - promoting/revoking admin rights over the network felt like a bigger decision than anything else exposed to the web UI):
+
+```q
+setAdmin[`someuser; 1b]   / grant
+setAdmin[`someuser; 0b]   / revoke
+```
+
+Once a user has `isAdmin`, they get an "Admin" button in the header leading to a panel that can create new accounts and delete existing ones (which also deletes every file that account owns - there'd be no way to ever decrypt them again anyway). Creating a user from this panel still never sends the chosen password over the wire: the admin's own browser computes the salted auth hash locally (the same derivation `changePassword` already uses) and sends only that. Admins can't delete their own account from the panel, to avoid locking everyone out.
 
 ## Getting started
 
@@ -93,11 +105,25 @@ Once it's up, add a user from the q console (see [Adding users](#adding-users)) 
 This is the intended deployment target - small, silent, always-on, physically in your house.
 
 1. Install a 64-bit kdb+ build for your Pi's OS/architecture and point `$QHOME` at it.
-2. `bin/startup.sh` hard-codes `$QHOME/m64/q` (the macOS binary). Change that line to whichever subdirectory matches your Pi's kdb+ install (e.g. a Linux ARM build), or the process won't start.
-3. Clone the repo onto the Pi, `export BLACKBOX_HOME=...`, and run `./bin/startup.sh`.
+2. `bin/startup.sh` hard-codes `$QHOME/m64/q` (the macOS binary) and is meant for local development only (see below for why). For a real deployment, use `bin/blackbox.service` instead, and change its `ExecStart` line to whichever kdb+ subdirectory matches your Pi (e.g. `l64arm/q`).
+3. Clone the repo onto the Pi, edit the paths/user in `bin/blackbox.service` for your install location, then:
+   ```bash
+   sudo cp bin/blackbox.service /etc/systemd/system/
+   sudo systemctl daemon-reload
+   sudo systemctl enable --now blackbox
+   ```
+   This runs BlackBox as a proper service - starts on boot, restarts on crash, logs to `journalctl -u blackbox`. It deliberately does **not** reuse `bin/startup.sh`: that script hard-codes `rlwrap` (a readline wrapper for an interactive terminal, which a systemd service doesn't have) and the `-dev` flag (which skips the production error handling in `starter.q` - an uncaught startup error crashes with a raw stack trace instead of logging and exiting cleanly).
 4. The server binds `BLACKBOX_PORT` on all interfaces, so it's reachable from other devices on your LAN at `http://<pi-ip>:50667`. For access away from home, use a private tunnel (Tailscale is the easiest option) rather than port-forwarding - see [Security model](#security-model).
-5. Consider running it under `systemd` (or `screen`/`tmux` at minimum) so it survives reboots and SSH disconnects - none of that is set up in this repo yet.
-6. Watch your disk. Every upload is written to `BLACKBOX_VAULT_DIR` on the Pi's storage (SD card or attached drive) - there's no free-space check before a write starts, so a nearly-full disk can produce a silently truncated, unrecoverable file. Keep some headroom, especially on smaller SD cards.
+5. Set up automated backups the same way:
+   ```bash
+   sudo cp bin/blackbox-backup.service bin/blackbox-backup.timer /etc/systemd/system/
+   sudo systemctl daemon-reload
+   sudo systemctl enable --now blackbox-backup.timer
+   ```
+   This runs `bin/backup.sh` daily, snapshotting `kx/db/qdb` and `kx/db/vault` to a timestamped tarball (default: `$BLACKBOX_HOME/backups`, keeping the newest 14 - both configurable via `BLACKBOX_BACKUP_DIR`/`BLACKBOX_BACKUP_KEEP` in the unit file). The script only handles the *local* snapshot - point external storage or a cloud backend at that output directory with your own `rclone`/`rsync` job for actual off-box redundancy; that part is provider-specific and deliberately not baked in here.
+6. Watch your disk anyway. `startUpload` checks real, live free space on `BLACKBOX_VAULT_DIR`'s filesystem (via `df`) and rejects new uploads once headroom drops below `.config.MIN_DISK_HEADROOM_PCT` (5% by default) - but on a small SD card, that 5% might only be a few hundred MB. Keep an eye on it.
+
+*Caveat: I wrote and manually reviewed the systemd unit files, but couldn't actually execute-test them - macOS has no `systemd-analyze` to verify against, unlike everything else in this README, which was run against a real server before being documented. Check `systemctl status blackbox` after enabling it.*
 
 ## Configuration reference
 
@@ -107,8 +133,9 @@ Defined in `kx/q/starter.q`:
 |---|---|---|
 | `.config.MAXUPLOAD` | 2 GiB | Cap on a single file's base64-encoded size. Must be changed in lockstep with `MAX_UPLOAD_BASE64_BYTES` in `html/js/blackbox.js` - the two are not read from a shared source. |
 | `.config.MAXFAILS` | 5 | Failed login attempts allowed per WebSocket connection before further attempts are rejected. |
+| `.config.MIN_DISK_HEADROOM_PCT` | 5 | `startUpload` rejects new uploads once the vault filesystem's free space (checked live via `df -Pk`) drops below this percentage, or would drop below it once this file is written. |
 
-The "storage used" bar in the UI (`getSystemStats`) compares total uploaded bytes against a **hardcoded 64 GiB constant** in `blackbox.q` - it's cosmetic, not tied to actual free disk space on the host. Don't rely on it to know how much room you actually have left.
+The "storage used" bar in the UI (`getSystemStats`) is real, not a fixed quota: capacity shown is `(what you've used) + (whatever's actually free on the host disk right now)`, so it shrinks or grows as anything else on that disk - the OS, other apps, other users - uses or frees space.
 
 ## Directory structure
 
@@ -137,9 +164,12 @@ kx/
 
 - No self-service registration, and no recovery for a genuinely forgotten password (see [Adding users](#adding-users)) - intentional for a personal vault, but worth knowing before you hand this to family members who'll forget passwords. Changing a *known* password is self-service (see [Security model](#security-model)).
 - WebSocket transport is unencrypted (`ws://`) by default; see [Security model](#security-model) for how to expose this safely off-LAN.
-- No disk-space check before accepting an upload - a write that runs out of space partway through can leave a corrupt file that has to be re-uploaded.
-- The "storage used / capacity" indicator is cosmetic (see [Configuration reference](#configuration-reference)), not a real quota.
-- Single global vault per install - access control is per-user-account, but there's no sharing, folders, or permission tiers between users.
+- Single global vault per install - access control is per-user-account, but there's no sharing or permission tiers between users.
+- Deleting a file only removes that one revision. If older versions exist, the newest remaining one becomes current; there's no "delete this document and all its history" action from the main list.
+- Batch ZIP export decrypts and holds every selected file in browser memory before bundling them, so it's sized for "a handful of documents," not your entire vault at once.
+- "Folders" aren't a real schema feature - any tag containing `/` is treated as a path client-side. Simple and needs no migration, but it means a folder only exists as long as at least one file has a tag naming it, and renaming a folder means re-tagging every file in it. Matching is exact-depth, like a real filesystem: a file tagged `Documents/Tax/2025` lives *inside* a `2025` folder and won't show up while browsing `Documents` or `Documents/Tax` - you have to click all the way in. Tag shallower (e.g. plain `2025` as a second, non-folder tag alongside `Documents/Tax`) if you want a file to surface higher up.
+- Thumbnails only cover images (generated client-side via canvas, zero new dependencies). PDF thumbnails would need an actual PDF renderer - there's no browser-native way to get one, and pulling in something like pdf.js felt like a disproportionate dependency for a nice-to-have in an otherwise no-build-step app. PDFs still show a distinct icon and preview fine, just not a rendered thumbnail.
+- The first admin has to be granted from the console (`setAdmin`) - there's no way to become an admin purely from the web UI, by design (see [Adding users](#adding-users)).
 
 ## License
 

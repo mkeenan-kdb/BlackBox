@@ -47,6 +47,8 @@
                     <i class="ph ph-users"></i>
                     <span id="numUsers">0</span> Online
                 </div>
+                <button id="adminBtn" class="btn btn-secondary btn-small logout-btn hide"
+                    onclick="openAdminPanel()"><i class="ph ph-shield-star"></i> Admin</button>
                 <button id="changePasswordBtn" class="btn btn-secondary logout-btn hide"
                     onclick="openChangePassword()">Change Password</button>
                 <button id="logoutBtn" class="btn btn-secondary btn-small logout-btn hide"
@@ -121,6 +123,25 @@
                         <button class="tab-btn" data-category="Other" onclick="selectCategoryTab(this)">Other</button>
                     </div>
 
+                    <!-- Folder Navigation (built from any tag containing "/") - the folders
+                         themselves render as clickable rows at the top of #filesList below,
+                         this bar is just the breadcrumb back up. -->
+                    <div id="folderNav" class="folder-nav hide">
+                        <div id="folderBreadcrumb" class="folder-breadcrumb"></div>
+                    </div>
+
+                    <!-- Batch Selection Toolbar -->
+                    <div id="batchToolbar" class="batch-toolbar hide">
+                        <span id="batchSelectedCount">0 selected</span>
+                        <div class="batch-toolbar-actions">
+                            <button class="btn btn-secondary btn-small" onclick="downloadSelectedAsZip()">
+                                <i class="ph ph-file-zip"></i> Download as ZIP</button>
+                            <button class="btn btn-secondary btn-small file-action-danger" onclick="deleteSelectedFiles()">
+                                <i class="ph ph-trash"></i> Delete Selected</button>
+                            <button class="btn btn-secondary btn-small" onclick="clearSelection()">Clear</button>
+                        </div>
+                    </div>
+
                     <div id="filesList" class="files-list">
                         <div class="no-files">No files uploaded yet.</div>
                     </div>
@@ -193,6 +214,35 @@
         </div>
     </div>
 
+    <!-- Admin: User Management Modal -->
+    <div id="adminModal" class="modal-overlay hide">
+        <div class="modal preview-modal glass-panel">
+            <div class="modal-header">
+                <h3>Manage Users</h3>
+                <button class="close-btn" onclick="closeAdminPanel()"><i class="ph ph-x"></i></button>
+            </div>
+            <div class="modal-body admin-modal-body">
+                <div class="admin-create-user">
+                    <div class="input-group">
+                        <i class="ph ph-user"></i>
+                        <input type="text" id="newUserIdInput" placeholder="New username" autocomplete="off" />
+                    </div>
+                    <div class="input-group">
+                        <i class="ph ph-lock-key"></i>
+                        <input type="password" id="newUserPasswordInput" placeholder="Initial passphrase" autocomplete="off" />
+                    </div>
+                    <div class="input-group">
+                        <i class="ph ph-lock-key"></i>
+                        <input type="password" id="newUserConfirmInput" placeholder="Confirm passphrase" autocomplete="off" />
+                    </div>
+                    <button class="btn btn-primary full-width" onclick="submitCreateUser()">Create User</button>
+                    <p class="admin-hint">Tell them this passphrase out of band - there's no email/reset flow, so they'll need it to log in the first time (and can change it themselves afterwards).</p>
+                </div>
+                <div id="adminUserListBody" class="files-list"></div>
+            </div>
+        </div>
+    </div>
+
     <!-- Preview Modal -->
     <div id="previewModal" class="modal-overlay hide">
         <div class="modal preview-modal glass-panel">
@@ -208,6 +258,23 @@
             </div>
         </div>
     </div>
+
+    <!-- Version History Modal -->
+    <div id="versionHistoryModal" class="modal-overlay hide">
+        <div class="modal preview-modal glass-panel">
+            <div class="modal-header">
+                <h3 id="versionHistoryTitle">Version History</h3>
+                <button class="close-btn" onclick="closeVersionHistory()"><i class="ph ph-x"></i></button>
+            </div>
+            <div id="versionHistoryBody" class="modal-body preview-body">
+                <!-- Dynamically filled with one row per version -->
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-primary" onclick="promptNewVersion()">Upload New Version</button>
+            </div>
+        </div>
+    </div>
+    <input type="file" id="newVersionFileInput" class="hide" onchange="handleNewVersionFileSelected()" />
 
     <!-- Global Loader -->
     <div id="overlay" class="global-overlay hide">

@@ -1,0 +1,45 @@
+[Unit]
+Description=BlackBox encrypted personal file vault
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# Adjust these three for your install location and the user you want the service to run as
+# (create a dedicated non-root user for this rather than running as root or your own login).
+User=blackbox
+WorkingDirectory=/opt/blackbox
+Environment=BLACKBOX_HOME=/opt/blackbox
+
+Environment=BLACKBOX_PORT=50667
+Environment=BLACKBOX_KX_HOME=/opt/blackbox/kx
+Environment=BLACKBOX_Q_SCRIPT_DIR=/opt/blackbox/kx/q
+Environment=BLACKBOX_DB_DIR=/opt/blackbox/kx/db/qdb
+Environment=BLACKBOX_VAULT_DIR=/opt/blackbox/kx/db/vault
+Environment=BLACKBOX_USER_CONFIG=/opt/blackbox/kx/db/misc/users
+Environment=BLACKBOX_HTML_DIR=/opt/blackbox/html
+Environment=QHOME=/opt/blackbox/q
+
+# Deliberately NOT bin/startup.sh: that script hardcodes rlwrap (a readline wrapper for an
+# interactive terminal, which a systemd service doesn't have) and the -dev flag (which skips
+# the production error handling in starter.q - an uncaught startup error crashes with a raw
+# stack trace instead of logging and exiting cleanly). Point this at whatever kdb+ binary
+# matches your platform - e.g. l64/q for 64-bit Linux, l64arm/q for 64-bit ARM/Raspberry Pi
+# OS (see the README's "Running on a Raspberry Pi" section).
+ExecStart=/opt/blackbox/q/l64arm/q /opt/blackbox/kx/q/starter.q
+
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+# Basic hardening. Loosen ProtectSystem/ReadWritePaths if it breaks something on your setup -
+# the one thing the process actually needs write access to is kx/db.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/blackbox/kx/db
+
+[Install]
+WantedBy=multi-user.target

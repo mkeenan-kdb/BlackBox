@@ -39,3 +39,15 @@ tar -czf "$BACKUP_TARGET.tar.gz" -C "$BACKUP_PARENT" "blackbox_backup_$TIMESTAMP
 rm -rf "$BACKUP_TARGET"
 
 echo "Success! Backup saved to: $BACKUP_TARGET.tar.gz"
+
+# Retention: an unattended backup script that never deletes anything just becomes the next
+# full-disk incident (see the disk-space enforcement work elsewhere in this app) - keep the
+# newest N and prune the rest. Override with BLACKBOX_BACKUP_KEEP; 0 disables pruning.
+KEEP="${BLACKBOX_BACKUP_KEEP:-14}"
+if [ "$KEEP" -gt 0 ]; then
+    OLD=$(ls -1t "$BACKUP_PARENT"/blackbox_backup_*.tar.gz 2>/dev/null | tail -n +"$((KEEP + 1))")
+    if [ -n "$OLD" ]; then
+        echo "Pruning old backups beyond the newest $KEEP:"
+        echo "$OLD" | while IFS= read -r f; do echo "  removing $f"; rm -f "$f"; done
+    fi
+fi

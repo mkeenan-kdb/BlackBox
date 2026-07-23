@@ -22,29 +22,61 @@ if[not `uploads in key `.;
     iv:();
     salt:();
     fileKeyWrapped:();
-    fileKeyIv:());
+    fileKeyIv:();
+    docId:0#`g;
+    version:0#0Nj;
+    latest:0#0b;
+    thumbnail:();
+    thumbnailIv:());
   ];
 // Ensure uploads carries master-key-envelope columns (legacy rows load without them -
 // they keep decrypting via the old per-file salt path, see deriveKeyForSalt client-side)
 if[`uploads in key `.;
   if[not `fileKeyWrapped in cols uploads;
-    uploads:1!update fileKeyWrapped:(count i)#enlist"",fileKeyIv:(count i)#enlist"" from 0!uploads]];
+    uploads:1!update fileKeyWrapped:(count i)#enlist"",fileKeyIv:(count i)#enlist"" from 0!uploads];
+  // Ensure uploads carries versioning columns - every pre-existing row becomes version 1
+  // (and the only, therefore latest, version) of its own document.
+  if[not `docId in cols uploads;
+    uploads:1!update docId:fileid, version:(count i)#1, latest:(count i)#1b from 0!uploads];
+  // Ensure uploads carries thumbnail columns (legacy rows just show their file-type icon)
+  if[not `thumbnail in cols uploads;
+    uploads:1!update thumbnail:(count i)#enlist"",thumbnailIv:(count i)#enlist"" from 0!uploads]];
 
 // Ensure userinfo carries a per-user salt column (legacy rows load without one)
 if[`userinfo in key `.;
   if[not `salt in cols userinfo; userinfo:1!update salt:(count i)#enlist"" from 0!userinfo];
   // Ensure userinfo carries master-key-envelope columns (added for key-wrapping support)
   if[not `mek in cols userinfo;
-    userinfo:1!update mek:(count i)#enlist"",mekIv:(count i)#enlist"",wrapSalt:(count i)#enlist"" from 0!userinfo]];
+    userinfo:1!update mek:(count i)#enlist"",mekIv:(count i)#enlist"",wrapSalt:(count i)#enlist"" from 0!userinfo];
+  // Ensure userinfo carries an admin flag (nobody is admin by default - bootstrap the first
+  // one from the console with setAdmin, see below)
+  if[not `isAdmin in cols userinfo;
+    userinfo:1!update isAdmin:(count i)#0b from 0!userinfo]];
 
 //===================================LOGIC====================================//
 broadCast:{neg[x]@\:y;}
 
 recentUploadsForUser:{[params]
-  / Only ever return the authenticated caller's own metadata
+  / Only ever return the authenticated caller's own metadata. One row per document - only
+  / its latest version - older revisions are reachable via getFileVersions. fileKeyWrapped/
+  / fileKeyIv/salt are included so the client can decrypt a thumbnail directly from this
+  / list without a separate getDownloadToken round trip per file - it's not a new exposure,
+  / the owner could already fetch the same wrapped key per-file via a download token anyway.
   uid:.web.currentUser[];
-  res:select string fileid, fileName, mimeType, category, tags, uploadDate, fileSize from uploads where userid=uid;
+  res:select string fileid, fileName, mimeType, category, tags, uploadDate, fileSize,
+    string docId, version, fileKeyWrapped, fileKeyIv, salt, thumbnail, thumbnailIv
+    from uploads where userid=uid, latest;
   :("recentUploads";res);
+ }
+
+/ Every revision of one logical document, newest first. Used to populate a file's version
+/ history panel - download/preview of any listed fileid reuses the existing per-file flow.
+getFileVersions:{[params]
+  uid:.web.currentUser[];
+  did:`$params`docId;
+  res:`version xdesc select string fileid, fileName, uploadDate, fileSize, version, latest
+    from uploads where userid=uid, docId=did;
+  :("fileVersions";res);
  }
 
 deviceInfo:{
@@ -52,17 +84,36 @@ deviceInfo:{
   show x;
  }
 
-/ Begin a chunked upload: validate the declared size, allocate a fileid, and
-/ stash metadata until every chunk has landed via uploadChunk/finishUpload.
+/ Begin a chunked upload: validate the declared size, check there's actually room for it on
+/ the host disk, and stash metadata until every chunk has landed via uploadChunk/finishUpload.
 startUpload:{[params]
   uid:.web.currentUser[];
   fileSize:"j"$params`fileSize;
   if[.config.MAXUPLOAD < fileSize; :("Error";"File exceeds the maximum allowed size")];
 
+  / Reject up front if the disk is already too full, or if this file alone would push it
+  / past the threshold - both checked before a single byte is written, rather than
+  / discovering it mid-write with a truncated, unrecoverable file already on disk.
+  ds:.util.diskStats[.config.ENV[`BLACKBOX_VAULT_DIR]];
+  if[(100*ds[`availKB]%ds[`totalKB]) < .config.MIN_DISK_HEADROOM_PCT;
+    :("Error";"Server disk is nearly full - uploads are paused until space is freed")];
+  if[(100*(ds[`availKB]-fileSize%1024)%ds[`totalKB]) < .config.MIN_DISK_HEADROOM_PCT;
+    :("Error";"Not enough disk headroom left for a file this size")];
+
+  / An empty docId means a brand new document (this upload becomes its own v1); a non-empty
+  / one means "new version of an existing document" - which must already belong to this
+  / user, or anyone could attach revisions to (and hide the latest version of) someone
+  / else's file just by guessing/replaying a docId.
+  isNewVersion:0<count params`docId;
+  if[isNewVersion;
+    did:`$params`docId;
+    if[not uid in exec userid from uploads where docId=did;
+      :("Error";"Not authorised to version this file")]];
+
   fid:`$string first neg[1]?0Ng;
-  .web.uploadSessions[fid]:`userid`fileName`mimeType`category`tags`iv`salt`fileKeyWrapped`fileKeyIv`bytesWritten!(
+  .web.uploadSessions[fid]:`userid`fileName`mimeType`category`tags`iv`salt`fileKeyWrapped`fileKeyIv`docId`thumbnail`thumbnailIv`bytesWritten!(
     uid;params`fileName;params`mimeType;`$params`category;params`tags;params`iv;params`salt;
-    params`fileKeyWrapped;params`fileKeyIv;0);
+    params`fileKeyWrapped;params`fileKeyIv;$[isNewVersion;did;fid];params`thumbnail;params`thumbnailIv;0);
   .util.logm"Chunked upload started by ",string[uid]," for ",params[`fileName]," -> ",string fid;
   :("uploadStarted";(enlist`fileid)!enlist string fid);
  }
@@ -98,12 +149,20 @@ finishUpload:{[params]
   sess:.web.uploadSessions fid;
   if[not sess[`userid]~uid; :("Error";"Not authorised for this upload")];
 
-  `uploads upsert 1!enlist `fileid`userid`fileName`mimeType`category`tags`uploadDate`fileSize`iv`salt`fileKeyWrapped`fileKeyIv!(
+  did:sess`docId;
+  priorVersions:exec version from uploads where docId=did;
+  ver:1+max 0,priorVersions;
+  / Demote whatever was latest for this document before inserting the new current version -
+  / if this upload never reaches here, the old version simply stays latest.
+  if[0<count priorVersions; update latest:0b from `uploads where docId=did, latest];
+
+  `uploads upsert 1!enlist `fileid`userid`fileName`mimeType`category`tags`uploadDate`fileSize`iv`salt`fileKeyWrapped`fileKeyIv`docId`version`latest`thumbnail`thumbnailIv!(
     fid;uid;sess`fileName;sess`mimeType;sess`category;sess`tags;.z.P;sess`bytesWritten;sess`iv;sess`salt;
-    sess`fileKeyWrapped;sess`fileKeyIv);
+    sess`fileKeyWrapped;sess`fileKeyIv;did;ver;1b;sess`thumbnail;sess`thumbnailIv);
   .util.persist[`uploads];
   .web.uploadSessions:.web.uploadSessions _ fid;
   .util.logm"Chunked upload finished for ",string[uid]," -> ",string fid;
+  notifyFileListChanged[uid];
   :("uploadSuccess";sess`fileName);
  }
 
@@ -142,17 +201,30 @@ deleteFile:{[params]
   .[hdel;enlist hsym `$fpth;{[p;e] .util.logm"Vault file already absent: ",p}[fpth]];
 
   `uploads set 1!delete from 0!uploads where fileid=fid;
+
+  / If this was the current revision, promote the next-newest remaining one so the document
+  / doesn't just vanish from the list while older versions still exist.
+  if[rec`latest;
+    remaining:0!select from uploads where docId=rec`docId;
+    if[0<count remaining;
+      newest:first `version xdesc remaining;
+      update latest:1b from `uploads where fileid=newest`fileid]];
+
   .util.persist[`uploads];
   .util.logm"Deleted file ",string[fid]," for ",string uid;
+  notifyFileListChanged[uid];
   :("deleteSuccess";string fid);
  }
 
 getSystemStats:{[params]
   uid:.web.currentUser[];
-  totalSize:exec sum fileSize from uploads where userid=uid;
-  / 64GB simulated capacity
-  capacity:68719476736;
-  :("systemStats";`used`capacity!(0^totalSize;capacity));
+  totalSize:0^exec sum fileSize from uploads where userid=uid;
+  / Capacity isn't a fixed quota - it's "what you've used plus whatever's actually free on
+  / the host disk right now", so it honestly shrinks/grows as anything else on that disk
+  / (OS, other apps, other users) uses or frees space, instead of showing a fake ceiling.
+  ds:.util.diskStats[.config.ENV[`BLACKBOX_VAULT_DIR]];
+  capacity:totalSize+1024*ds[`availKB];
+  :("systemStats";`used`capacity!(totalSize;capacity));
  }
 
 updUserNumUsers:{
@@ -163,12 +235,91 @@ updUserNumUsers:{
   broadCast[(exec handle from dailyConns)active;msg];
  }
 
+/ Push a lightweight refresh signal to every active session (tab/device) for this user, so
+/ an upload or delete made from one device shows up on others without a manual reload. The
+/ receiving client just re-fetches its own file list/stats - no diff is sent, so this can't
+/ leak anything a plain recentUploadsForUser call wouldn't already.
+notifyFileListChanged:{[uid]
+  / Exclude the calling handle - it already refreshes itself via the direct
+  / uploadSuccess/deleteSuccess response, so this is only for the user's OTHER tabs/devices.
+  handles:(exec handle from dailyConns where uid=userid,event=`open,not null sessionStart,null sessionEnd) except .z.w;
+  if[0=count handles; :(::)];
+  msg:-8!.j.j(`fileListUpdated;1b),enlist string[.z.T];
+  broadCast[handles;msg];
+ }
+
 /addUser `userid`passphrase!("myUser";"myPassword")
 addUser:{
   uid:`$x`userid;
   salt:.util.newSalt[];
   .util.logm"Adding new user: ",string uid;
   .util.putUser[uid;.util.hashPass[salt;x`passphrase];salt];
+ }
+
+/setAdmin[`myUser;1b]  -- grant admin rights (or 0b to revoke). Console-only, deliberately -
+/granting the ability to create/delete other accounts over the network is a bigger decision
+/than anything else exposed to the web UI, so it stays a physical/SSH-access action, same as
+/account creation itself always has been. Bootstrap your first admin with this after addUser.
+setAdmin:{[uid;flag]
+  known:(`userinfo in key `.) and uid in exec userid from userinfo;
+  if[not known; '"unknown user"];
+  userinfo[uid;`isAdmin]:flag;
+  .util.persist[`userinfo];
+  .util.logm"Admin flag for ",string[uid]," set to ",string flag;
+ }
+
+/ Shared guard for the admin-only functions below - .web.allowed only checks "is this
+/ function reachable at all", not "is THIS caller allowed to call it".
+requireAdmin:{[uid] (`userinfo in key `.) and uid in exec userid from userinfo where isAdmin}
+
+/ Admin-only: list every account with basic stats, for the user-management panel.
+adminListUsers:{[params]
+  uid:.web.currentUser[];
+  if[not requireAdmin[uid]; :("Error";"Not authorised")];
+  base:`userid xkey select userid, isAdmin from userinfo;
+  perUser:select numFiles:count i, totalSize:sum fileSize by userid from uploads where latest;
+  joined:0!base lj perUser;
+  joined:update numFiles:0^numFiles, totalSize:0^totalSize from joined;
+  :("adminUsersList";select string userid, isAdmin, numFiles, totalSize from joined);
+ }
+
+/ Admin-only: create a new account. The initial password never crosses the wire even here -
+/ the admin's browser computes the salted auth hash locally (same derivation changePassword
+/ already uses) and sends only that; the new user's MEK bootstraps itself on their own first
+/ login exactly like a console-created account does.
+adminCreateUser:{[params]
+  uid:.web.currentUser[];
+  if[not requireAdmin[uid]; :("Error";"Not authorised")];
+  newUid:`$params`userid;
+  if[0=count string newUid; :("Error";"Username is required")];
+  if[(`userinfo in key `.) and newUid in exec userid from userinfo;
+    :("Error";"That username already exists")];
+  .util.putUser[newUid;params`newHash;params`newSalt];
+  .util.logm"Admin ",string[uid]," created user ",string newUid;
+  :("adminUserCreated";string newUid);
+ }
+
+/ Admin-only: permanently delete an account and every file it owns - no one could ever
+/ decrypt those files again without the account anyway, so leaving them behind would just be
+/ orphaned, unrecoverable ciphertext taking up space.
+adminDeleteUser:{[params]
+  uid:.web.currentUser[];
+  if[not requireAdmin[uid]; :("Error";"Not authorised")];
+  targetUid:`$params`userid;
+  if[targetUid~uid; :("Error";"Cannot delete your own account")];
+  if[not targetUid in exec userid from userinfo; :("Error";"User not found")];
+
+  theirFiles:exec fileid from uploads where userid=targetUid;
+  {[fid]
+    fpth:.config.ENV[`BLACKBOX_VAULT_DIR],"/",string fid;
+    .[hdel;enlist hsym `$fpth;{[p;e] .util.logm"Vault file already absent: ",p}[fpth]];
+   } each theirFiles;
+  `uploads set 1!delete from 0!uploads where userid=targetUid;
+  `userinfo set 1!delete from 0!userinfo where userid=targetUid;
+  .util.persist[`uploads];
+  .util.persist[`userinfo];
+  .util.logm"Admin ",string[uid]," deleted user ",string[targetUid]," (",string[count theirFiles]," files removed)";
+  :("adminUserDeleted";string targetUid);
  }
 
 / Issue a single-use login challenge. The salt is whatever's actually stored for this user
@@ -195,7 +346,7 @@ getAuthChallenge:{[params]
 / than real SRP (q has no SHA-256 or bignum to build that on safely).
 authUser:{[creds]
   .util.logm"Requesting authentication for handle: ",string[.z.w];
-  noAuth:{("authResp";`ok`mek`mekIv`wrapSalt!(0b;"";"";""))};
+  noAuth:{("authResp";`ok`mek`mekIv`wrapSalt`isAdmin!(0b;"";"";"";0b))};
   if[any all@/:null creds; :noAuth[]];
   if[not `userinfo in key `.; :noAuth[]];
 
@@ -227,7 +378,7 @@ authUser:{[creds]
   / mek/mekIv/wrapSalt are blank for a user who has never logged in from a browser yet
   / (created via console addUser) or who predates the master-key-envelope scheme - the
   / client bootstraps a fresh one in that case (see handleAuth/setMEK).
-  :("authResp";`ok`mek`mekIv`wrapSalt!(1b;rec`mek;rec`mekIv;rec`wrapSalt));
+  :("authResp";`ok`mek`mekIv`wrapSalt`isAdmin!(1b;rec`mek;rec`mekIv;rec`wrapSalt;rec`isAdmin));
  }
 
 / Client-driven upgrade of a legacy (pre-salt, single-round-md5) auth hash to the salted

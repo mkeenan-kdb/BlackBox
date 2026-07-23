@@ -63,6 +63,14 @@ const connect = () => {
                     case "numUsers":
                         updUsersOnline(msgData);
                         break;
+                    case "fileListUpdated":
+                        // Pushed when a file changed from another tab/device for this same
+                        // user - just re-fetch, no diff is sent.
+                        if (window.currentUser) {
+                            socket.sendCmd("recentUploadsForUser", { userid: window.currentUser });
+                            socket.sendCmd("getSystemStats", { userid: window.currentUser });
+                        }
+                        break;
                     case "notifyUser":
                         toggleServerBusy(false);
                         notifyUser(msgData);
@@ -78,6 +86,10 @@ const connect = () => {
                     case "passwordChanged":
                     case "authChallenge":
                     case "legacyAuthUpgraded":
+                    case "fileVersions":
+                    case "adminUsersList":
+                    case "adminUserCreated":
+                    case "adminUserDeleted":
                         if (pendingResponse) {
                             const { resolve } = pendingResponse;
                             pendingResponse = null;
@@ -99,7 +111,16 @@ const connect = () => {
                         break;
                     case "deleteSuccess":
                         toggleServerBusy(false);
-                        notifyUser({ head: "File Deleted", body: "File removed from the vault." });
+                        // Batch delete (deleteSelectedFiles) awaits each call via sendCorrelated
+                        // and shows its own single summary toast instead of one per file.
+                        if (pendingResponse) {
+                            const { resolve } = pendingResponse;
+                            pendingResponse = null;
+                            resolve(msgData);
+                        }
+                        if (!window._suppressDeleteNotify) {
+                            notifyUser({ head: "File Deleted", body: "File removed from the vault." });
+                        }
                         if (window.currentUser) {
                             socket.sendCmd("recentUploadsForUser", { userid: window.currentUser });
                             socket.sendCmd("getSystemStats", { userid: window.currentUser });

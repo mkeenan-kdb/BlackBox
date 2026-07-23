@@ -1,0 +1,14 @@
+[Unit]
+Description=BlackBox database/vault backup
+# Only meaningful once blackbox.service exists on this box - not a hard dependency, since a
+# backup is still worth taking even if the service happens to be down when the timer fires.
+After=blackbox.service
+
+[Service]
+Type=oneshot
+User=blackbox
+Environment=BLACKBOX_HOME=/opt/blackbox
+# Optional: point backups at mounted external storage, and/or change retention count.
+# Environment=BLACKBOX_BACKUP_DIR=/mnt/external-drive/blackbox-backups
+# Environment=BLACKBOX_BACKUP_KEEP=30
+ExecStart=/opt/blackbox/bin/backup.sh
