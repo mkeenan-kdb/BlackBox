@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>BlackBox</title>
+    <!-- Modern Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;800&display=swap" rel="stylesheet">
+    <!-- Modern Icons (Phosphor Icons) -->
+    <script src="https://unpkg.com/@phosphor-icons/web"></script>
+
+    <link href="css/style.css" rel="stylesheet" type="text/css">
+
+    <!-- Scripts -->
+    <script src="js/external/c.js"></script>
+    <script src="js/mobile.js"></script>
+    <script src="js/connect.js" defer></script>
+    <script src="js/blackbox.js" defer></script>
+</head>
+
+<body>
+    <!-- Background Animation Elements -->
+    <div class="bg-orb orb-1"></div>
+    <div class="bg-orb orb-2"></div>
+    <div class="bg-orb orb-3"></div>
+
+    <!-- Main Content App -->
+    <main class="app-container">
+        <!-- Top Navigation / Header -->
+        <header class="glass-header">
+            <div class="logo">
+                <i class="ph-fill ph-cube"></i>
+                <span>BlackBox</span>
+            </div>
+            <div class="header-right">
+                <div class="storage-gauge">
+                    <span class="storage-text"><span id="storageUsed">0 B</span> / <span id="storageCapacity">64
+                            GB</span></span>
+                    <div class="progress-bar-wrapper">
+                        <div id="storageProgressBar" class="progress-bar" style="width: 0%"></div>
+                    </div>
+                </div>
+                <div class="user-stats">
+                    <i class="ph ph-users"></i>
+                    <span id="numUsers">0</span> Online
+                </div>
+                <button id="logoutBtn" class="btn btn-secondary btn-small logout-btn hide"
+                    onclick="logout()">Lock</button>
+            </div>
+        </header>
+
+        <!-- Main Dashboard Area -->
+        <section class="dashboard">
+            <div class="hero-text">
+                <h1>Secure. Fast. Reliable.</h1>
+                <p>Welcome to the next generation BlackBox network. Upload and share files seamlessly.</p>
+            </div>
+
+            <div class="dashboard-panels">
+                <!-- Upload Area -->
+                <div id="uploadContainer" class="upload-zone glass-panel">
+                    <div class="upload-icon-wrapper">
+                        <i class="ph ph-cloud-arrow-up"></i>
+                    </div>
+                    <h3>Upload Documents</h3>
+                    <p>Drag & drop files here or click to browse</p>
+                    <form id="uploadForm" onsubmit="event.preventDefault();">
+                        <input id="file" type="file" class="file-input" multiple />
+
+                        <!-- Metadata Fields -->
+                        <div class="form-group">
+                            <label for="fileCategory">Category</label>
+                            <select id="fileCategory">
+                                <option value="Other">Other</option>
+                                <option value="Identity">Identity</option>
+                                <option value="Financial">Financial</option>
+                                <option value="Legal">Legal</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label for="fileTags">Tags (comma separated)</label>
+                            <input type="text" id="fileTags" placeholder="e.g. tax, receipt, 2026" />
+                        </div>
+                    </form>
+                    <div class="upload-actions">
+                        <button class="btn btn-primary" onclick="uploadFiles()">Upload Files</button>
+                    </div>
+                    <div id="uploadProgress" class="upload-progress hide">
+                        <p id="uploadProgressLabel" class="upload-progress-label">Uploading...</p>
+                        <div class="progress-bar-wrapper">
+                            <div id="uploadProgressBar" class="progress-bar" style="width: 0%"></div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Uploaded Files Panel -->
+                <div class="files-panel glass-panel">
+                    <div class="files-panel-header">
+                        <h3>Uploaded Files</h3>
+                        <div class="search-box">
+                            <i class="ph ph-magnifying-glass"></i>
+                            <input type="text" id="searchInput" oninput="filterFiles()"
+                                placeholder="Search files or tags..." />
+                        </div>
+                    </div>
+
+                    <!-- Category Filter Tabs -->
+                    <div class="category-tabs">
+                        <button class="tab-btn active" data-category="All"
+                            onclick="selectCategoryTab(this)">All</button>
+                        <button class="tab-btn" data-category="Identity"
+                            onclick="selectCategoryTab(this)">Identity</button>
+                        <button class="tab-btn" data-category="Financial"
+                            onclick="selectCategoryTab(this)">Financial</button>
+                        <button class="tab-btn" data-category="Legal" onclick="selectCategoryTab(this)">Legal</button>
+                        <button class="tab-btn" data-category="Other" onclick="selectCategoryTab(this)">Other</button>
+                    </div>
+
+                    <div id="filesList" class="files-list">
+                        <div class="no-files">No files uploaded yet.</div>
+                    </div>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <!-- Global Notification System -->
+    <div id="notificationToast" class="toast hide">
+        <div class="toast-content">
+            <i class="ph ph-info"></i>
+            <div>
+                <h4 id="dialogHead">Notification</h4>
+                <p id="dialogBody">Message goes here</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- Auth Modal (Glassmorphism) -->
+    <div id="authModal" class="modal-overlay hide">
+        <div class="modal glass-panel">
+            <div class="modal-header">
+                <i class="ph-fill ph-cube"></i>
+                <h2>Connect to BlackBox</h2>
+            </div>
+            <div class="modal-body">
+                <p>Please authenticate to access the network.</p>
+                <div class="input-group">
+                    <i class="ph ph-user"></i>
+                    <input type="text" id="usernameInput" placeholder="Username" autocomplete="off" />
+                </div>
+                <div class="input-group">
+                    <i class="ph ph-lock-key"></i>
+                    <input type="password" id="passwordInput" placeholder="Passphrase" />
+                </div>
+                <button class="btn btn-primary full-width" id="loginBtn" onclick="submitAuth()">Authenticate</button>
+            </div>
+            <div id="authSpinner" class="spinner-container hide">
+                <i class="ph ph-spinner-gap spin-icon"></i>
+                <p>Connecting...</p>
+            </div>
+        </div>
+    </div>
+
+    <!-- Preview Modal -->
+    <div id="previewModal" class="modal-overlay hide">
+        <div class="modal preview-modal glass-panel">
+            <div class="modal-header">
+                <h3 id="previewTitle">File Preview</h3>
+                <button class="close-btn" onclick="closePreviewModal()"><i class="ph ph-x"></i></button>
+            </div>
+            <div id="previewBody" class="modal-body preview-body">
+                <!-- Dynamically filled with iframe, img, or pre -->
+            </div>
+            <div class="modal-footer">
+                <button id="previewDownloadBtn" class="btn btn-primary">Download File</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Global Loader -->
+    <div id="overlay" class="global-overlay hide">
+        <i class="ph ph-spinner-gap spin-icon global-spin"></i>
+    </div>
+</body>
+
+</html>
