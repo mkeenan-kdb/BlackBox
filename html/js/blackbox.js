@@ -598,6 +598,7 @@ const refreshAdminUserList = async () => {
             const label = document.createElement("span");
             label.className = "file-name";
             label.textContent = u.userid;
+            label.title = u.userid;
             info.appendChild(label);
             if (u.isAdmin) {
                 const badge = document.createElement("span");
@@ -814,6 +815,7 @@ const renderFolderBreadcrumb = () => {
     const rootCrumb = document.createElement("span");
     rootCrumb.className = "folder-crumb" + (activeFolderPath.length === 0 ? " active" : "");
     rootCrumb.innerHTML = '<i class="ph ph-folders"></i> All Folders';
+    rootCrumb.title = "All Folders";
     rootCrumb.onclick = () => { activeFolderPath = []; filterFiles(); };
     breadcrumb.appendChild(rootCrumb);
 
@@ -826,6 +828,7 @@ const renderFolderBreadcrumb = () => {
         const crumb = document.createElement("span");
         crumb.className = "folder-crumb" + (i === activeFolderPath.length - 1 ? " active" : "");
         crumb.textContent = seg;
+        crumb.title = seg;
         crumb.onclick = () => { activeFolderPath = activeFolderPath.slice(0, i + 1); filterFiles(); };
         breadcrumb.appendChild(crumb);
     });
@@ -847,10 +850,15 @@ const renderFolderRow = (name) => {
     icon.className = "ph-fill ph-folder";
     info.appendChild(icon);
 
+    const textWrapper = document.createElement("div");
+    textWrapper.className = "file-text-wrapper";
+
     const label = document.createElement("span");
     label.className = "file-name";
     label.textContent = name;
-    info.appendChild(label);
+    label.title = name;
+    textWrapper.appendChild(label);
+    info.appendChild(textWrapper);
 
     const n = countFilesUnder(childPath);
     const count = document.createElement("span");
@@ -931,6 +939,7 @@ const filterFiles = () => {
         icon.className = getFileIcon(file.mimeType);
 
         const textWrapper = document.createElement("div");
+        textWrapper.className = "file-text-wrapper";
 
         const name = document.createElement("span");
         name.className = "file-name";
@@ -939,14 +948,16 @@ const filterFiles = () => {
 
         textWrapper.appendChild(name);
 
-        // Display tags
-        if (file.tags) {
+        // Display non-folder tags
+        const displayTags = fileTagList(file).filter(t => t && !t.includes("/"));
+        if (displayTags.length > 0) {
             const tagsList = document.createElement("div");
             tagsList.className = "file-tags-list";
-            file.tags.split(",").forEach(t => {
+            displayTags.forEach(t => {
                 const badge = document.createElement("span");
                 badge.className = "tag-badge";
-                badge.textContent = t.trim();
+                badge.textContent = t;
+                badge.title = t;
                 tagsList.appendChild(badge);
             });
             textWrapper.appendChild(tagsList);
@@ -1468,7 +1479,9 @@ const deleteFile = (fileid, fileName) => {
 // Used when the file's mimeType isn't previewable - never fetches/decrypts the file.
 const showUnsupportedPreview = (fileid, fileName) => {
     document.getElementById("previewModal").classList.remove("hide");
-    document.getElementById("previewTitle").textContent = fileName;
+    const previewTitle = document.getElementById("previewTitle");
+    previewTitle.textContent = fileName;
+    previewTitle.title = fileName;
 
     const body = document.getElementById("previewBody");
     body.innerHTML = "";
@@ -1489,7 +1502,9 @@ const showUnsupportedPreview = (fileid, fileName) => {
 
 const showPreview = (fileName, mimeType, arrayBuffer) => {
     document.getElementById("previewModal").classList.remove("hide");
-    document.getElementById("previewTitle").textContent = fileName;
+    const previewTitle = document.getElementById("previewTitle");
+    previewTitle.textContent = fileName;
+    previewTitle.title = fileName;
 
     const body = document.getElementById("previewBody");
     body.innerHTML = "";
@@ -1551,7 +1566,9 @@ let versionHistoryContext = null;
 const openVersionHistory = async (file) => {
     versionHistoryContext = { docId: file.docId, category: file.category, tags: file.tags };
     document.getElementById("versionHistoryModal").classList.remove("hide");
-    document.getElementById("versionHistoryTitle").textContent = `Version History: ${file.fileName}`;
+    const titleElem = document.getElementById("versionHistoryTitle");
+    titleElem.textContent = `Version History: ${file.fileName}`;
+    titleElem.title = `Version History: ${file.fileName}`;
 
     const body = document.getElementById("versionHistoryBody");
     body.innerHTML = "";
@@ -1581,6 +1598,7 @@ const openVersionHistory = async (file) => {
             label.className = "file-name";
             const when = v.uploadDate ? new Date(v.uploadDate).toLocaleString() : "";
             label.textContent = `v${v.version}${v.latest ? " (current)" : ""} - ${formatBytes(v.fileSize)} - ${when}`;
+            label.title = label.textContent;
             info.appendChild(label);
             row.appendChild(info);
 
@@ -1725,6 +1743,233 @@ const checkSecureContext = () => {
     }
 };
 
+// ============================== TAG AUTOCOMPLETE ============================== //
+const DEFAULT_TAG_SUGGESTIONS = [
+    "image", "document", "pdf", "financial", "legal", "identity",
+    "text", "csv", "json", "tax", "receipt", "invoice"
+];
+
+const getAllAvailableTags = () => {
+    const tagsSet = new Set(DEFAULT_TAG_SUGGESTIONS);
+    allFiles.forEach((file) => {
+        if (!file || !file.tags) return;
+        file.tags.split(",").forEach((t) => {
+            const trimmed = t.trim();
+            if (trimmed) tagsSet.add(trimmed);
+        });
+    });
+    return Array.from(tagsSet).sort();
+};
+
+const initTagAutocomplete = () => {
+    const input = document.getElementById("fileTags");
+    const dropdown = document.getElementById("tagAutocompleteDropdown");
+    if (!input || !dropdown) return;
+
+    let activeIndex = -1;
+    let currentMatches = [];
+
+    const getCurrentTokenInfo = () => {
+        const val = input.value;
+        const cursorPos = input.selectionStart || val.length;
+        const lastComma = val.lastIndexOf(",", cursorPos - 1);
+        const nextComma = val.indexOf(",", cursorPos);
+        const start = lastComma === -1 ? 0 : lastComma + 1;
+        const end = nextComma === -1 ? val.length : nextComma;
+        const rawToken = val.substring(start, end);
+        const query = rawToken.trim();
+        return { start, end, rawToken, query, val };
+    };
+
+    const hideDropdown = () => {
+        dropdown.classList.add("hide");
+        dropdown.innerHTML = "";
+        activeIndex = -1;
+        currentMatches = [];
+    };
+
+    const selectMatch = (tag) => {
+        const { start, end, val } = getCurrentTokenInfo();
+        const before = val.substring(0, start).trimEnd();
+        const after = val.substring(end).replace(/^[\s,]*/, "");
+        
+        let newVal = "";
+        if (before) {
+            newVal += before + (before.endsWith(",") ? " " : ", ") + tag;
+        } else {
+            newVal += tag;
+        }
+        newVal += ", ";
+        if (after) {
+            newVal += after;
+        }
+
+        input.value = newVal;
+        const newCursorPos = before ? (before + (before.endsWith(",") ? " " : ", ") + tag + ", ").length : (tag + ", ").length;
+        input.setSelectionRange(newCursorPos, newCursorPos);
+        input.focus();
+        hideDropdown();
+    };
+
+    const updateActiveItem = () => {
+        const items = dropdown.querySelectorAll(".autocomplete-item");
+        items.forEach((item, idx) => {
+            if (idx === activeIndex) {
+                item.classList.add("active");
+                item.scrollIntoView({ block: "nearest" });
+            } else {
+                item.classList.remove("active");
+            }
+        });
+    };
+
+    const renderMatches = (matches, query) => {
+        dropdown.innerHTML = "";
+        currentMatches = matches;
+        activeIndex = 0;
+
+        matches.forEach((tag, idx) => {
+            const item = document.createElement("div");
+            item.className = "autocomplete-item" + (idx === 0 ? " active" : "");
+
+            const isDir = tag.includes("/");
+            const icon = document.createElement("i");
+            icon.className = isDir ? "ph ph-folder" : "ph ph-tag";
+            item.appendChild(icon);
+
+            const label = document.createElement("span");
+            label.className = "autocomplete-label";
+
+            // Split tag into matching and non-matching segments
+            const lowerTag = tag.toLowerCase();
+            const lowerQuery = query.toLowerCase();
+            const matchIndex = lowerTag.indexOf(lowerQuery);
+
+            if (matchIndex >= 0) {
+                const prefix = tag.substring(0, matchIndex);
+                const matched = tag.substring(matchIndex, matchIndex + query.length);
+                const suffix = tag.substring(matchIndex + query.length);
+
+                if (prefix) {
+                    const preSpan = document.createElement("span");
+                    preSpan.className = "autocomplete-dim";
+                    preSpan.textContent = prefix;
+                    label.appendChild(preSpan);
+                }
+
+                const matchSpan = document.createElement("span");
+                matchSpan.className = "autocomplete-match";
+                matchSpan.textContent = matched;
+                label.appendChild(matchSpan);
+
+                if (suffix) {
+                    const postSpan = document.createElement("span");
+                    postSpan.className = "autocomplete-dim";
+                    postSpan.textContent = suffix;
+                    label.appendChild(postSpan);
+                }
+            } else {
+                label.textContent = tag;
+            }
+
+            item.appendChild(label);
+
+            const typeBadge = document.createElement("span");
+            typeBadge.className = "autocomplete-tag-type";
+            typeBadge.textContent = isDir ? "dir" : "tag";
+            item.appendChild(typeBadge);
+
+            item.addEventListener("mousedown", (e) => {
+                e.preventDefault();
+                selectMatch(tag);
+            });
+
+            item.addEventListener("mouseenter", () => {
+                activeIndex = idx;
+                updateActiveItem();
+            });
+
+            dropdown.appendChild(item);
+        });
+
+        dropdown.classList.remove("hide");
+    };
+
+    const handleInput = () => {
+        const { query, val } = getCurrentTokenInfo();
+        if (!query) {
+            hideDropdown();
+            return;
+        }
+
+        const allTags = getAllAvailableTags();
+        const lowerQuery = query.toLowerCase();
+
+        // Collect existing tags in the input to avoid suggesting duplicates
+        const currentSelectedTags = new Set(
+            val.split(",").map((t) => t.trim().toLowerCase()).filter((t) => t && t !== lowerQuery)
+        );
+
+        // Match tags that contain the query
+        const matches = allTags.filter((tag) => {
+            const lower = tag.toLowerCase();
+            if (currentSelectedTags.has(lower)) return false;
+            return lower.includes(lowerQuery);
+        });
+
+        if (!matches.length) {
+            hideDropdown();
+            return;
+        }
+
+        // Sort: prefix matches first, then shorter matches, then alphabetical
+        matches.sort((a, b) => {
+            const aLower = a.toLowerCase();
+            const bLower = b.toLowerCase();
+            const aStarts = aLower.startsWith(lowerQuery);
+            const bStarts = bLower.startsWith(lowerQuery);
+            if (aStarts && !bStarts) return -1;
+            if (!aStarts && bStarts) return 1;
+            return a.length - b.length || a.localeCompare(b);
+        });
+
+        renderMatches(matches.slice(0, 10), query);
+    };
+
+    input.addEventListener("input", handleInput);
+    input.addEventListener("focus", handleInput);
+
+    input.addEventListener("keydown", (e) => {
+        if (dropdown.classList.contains("hide") || currentMatches.length === 0) {
+            return;
+        }
+
+        if (e.key === "ArrowDown") {
+            e.preventDefault();
+            activeIndex = (activeIndex + 1) % currentMatches.length;
+            updateActiveItem();
+        } else if (e.key === "ArrowUp") {
+            e.preventDefault();
+            activeIndex = (activeIndex - 1 + currentMatches.length) % currentMatches.length;
+            updateActiveItem();
+        } else if (e.key === "Enter" || e.key === "Tab") {
+            if (activeIndex >= 0 && activeIndex < currentMatches.length) {
+                e.preventDefault();
+                selectMatch(currentMatches[activeIndex]);
+            }
+        } else if (e.key === "Escape") {
+            e.preventDefault();
+            hideDropdown();
+        }
+    });
+
+    document.addEventListener("click", (e) => {
+        if (!input.contains(e.target) && !dropdown.contains(e.target)) {
+            hideDropdown();
+        }
+    });
+};
+
 // ============================== INIT ============================== //
 window.onload = () => {
     checkSecureContext();
@@ -1732,6 +1977,7 @@ window.onload = () => {
     initDragAndDrop();
     initEnterToLogin();
     initInactivityMonitor();
+    initTagAutocomplete();
     socket = connect();
     document.addEventListener("deviceready", () => {
         if (typeof onDeviceReady === 'function') onDeviceReady();

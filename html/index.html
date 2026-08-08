@@ -86,7 +86,10 @@
                         </div>
                         <div class="form-group">
                             <label for="fileTags">Tags (comma separated)</label>
-                            <input type="text" id="fileTags" placeholder="e.g. tax, receipt, 2026" />
+                            <div class="autocomplete-wrapper">
+                                <input type="text" id="fileTags" placeholder="e.g. tax, receipt, 2026" autocomplete="off" />
+                                <div id="tagAutocompleteDropdown" class="autocomplete-dropdown hide"></div>
+                            </div>
                         </div>
                     </form>
                     <div class="upload-actions">

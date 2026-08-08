@@ -2,6 +2,8 @@
 
 BlackBox is a self-hosted, encrypted personal file vault. It was built to run on a small always-on machine at home (a Raspberry Pi in a drawer, say) so you have a physical, private place to keep important files - the digital equivalent of a fireproof box, on hardware you own, on your own network.
 
+![BlackBox Screenshot](BlackBoxScreenshot.png)
+
 The backend is **q/kdb+**. The frontend is plain HTML/CSS/JavaScript with no build step. Files are encrypted **in the browser** before they ever leave the client; the server only ever stores and serves ciphertext.
 
 ## Contents
@@ -19,7 +21,7 @@ The backend is **q/kdb+**. The frontend is plain HTML/CSS/JavaScript with no bui
 
 ## What it is
 
-Open `index.html` in a browser, log in, and you get a small vault UI: drag-and-drop file uploads (with per-file progress, multi-file batches, and live image thumbnails), a searchable/tagged file list with hierarchical folder navigation (any tag containing `/`, e.g. `Documents/Tax/2026`), image/PDF/text preview, download, version history with the ability to upload a new revision of an existing file, and multi-select batch delete or bulk download as a ZIP. Everything is scoped per authenticated user - one vault, multiple accounts, each user only ever sees their own files - and stays in sync live across every open tab/device for that user.
+Open `index.html` in a browser, log in, and you get a small vault UI: drag-and-drop file uploads (with per-file progress, multi-file batches, keyboard-driven tag/directory autocompletion, and live image thumbnails), a searchable/tagged file list with hierarchical folder navigation (any tag containing `/`, e.g. `Documents/Tax/2026`), image/PDF/text preview, download, version history with the ability to upload a new revision of an existing file, and multi-select batch delete or bulk download as a ZIP. Everything is scoped per authenticated user - one vault, multiple accounts, each user only ever sees their own files - and stays in sync live across every open tab/device for that user.
 
 There's no cloud, no third-party storage, and no account system beyond what you set up yourself on the box it runs on.
 
@@ -141,23 +143,28 @@ The "storage used" bar in the UI (`getSystemStats`) is real, not a fixed quota: 
 
 ```
 bin/
-  startup.sh        entry point: sets env vars, launches q
+  startup.sh                  entry point: sets env vars, launches q in dev mode
+  backup.sh                   local snapshot script (timestamped tarballs of db and vault)
+  blackbox.service            systemd unit file for production deployment
+  blackbox-backup.service     systemd unit file for scheduled backup service
+  blackbox-backup.timer       systemd timer for automated daily backups
 html/
-  index.html         UI shell
-  js/connect.js       WebSocket lifecycle, request/response routing
-  js/blackbox.js       encryption, chunked upload/download, UI logic
-  js/external/         c.js (kdb+ IPC serialization), jQuery
-  css/, img/, fonts/    styling and assets
+  index.html                  UI shell
+  js/connect.js               WebSocket lifecycle, request/response routing
+  js/blackbox.js              encryption, chunked upload/download, tag autocomplete, UI logic
+  js/mobile.js                mobile device bridge
+  js/external/                c.js (kdb+ IPC serialization), jQuery, Bootstrap
+  css/, img/, fonts/          styling and assets
 kx/
   q/
-    starter.q          env var validation, startup sequencing
-    web.q               WebSocket handlers (.z.wo/.z.ws/.z.wc), HTTP download route (.z.ph)
-    blackbox.q          business logic: auth, upload/download, file metadata, user stats
-    util.q              password hashing, persistence, misc helpers
+    starter.q                 env var validation, startup sequencing, config defaults
+    web.q                     WebSocket handlers (.z.wo/.z.ws/.z.wc), HTTP download route (.z.ph)
+    blackbox.q                business logic: auth, upload/download, file metadata, user stats
+    util.q                    password hashing, persistence, misc helpers
   db/
-    qdb/                persisted tables: userinfo, uploads, session history (gitignored)
-    vault/              encrypted file blobs, one per upload (gitignored)
-    misc/users          reserved/unused placeholder
+    qdb/                      persisted tables: userinfo, uploads, session history (gitignored)
+    vault/                    encrypted file blobs, one per upload (gitignored)
+    misc/users                reserved/unused placeholder
 ```
 
 ## Known limitations
